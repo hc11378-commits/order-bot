@@ -7,7 +7,22 @@ const app = express();
 const CHANNEL_SECRET = 'ce5aafad66d4ea009b1f9ae3046035dd';
 const CHANNEL_ACCESS_TOKEN = 't7lUw3SX7cQVJpH5NthljqiLL5mBWCK9bFL1fam+ow99XRyrRK/2rw+5zxQtV3CmVn5jHGe8wsJFQ8cwHLOi2YAGENNR33yth7rIX6D6qSNDZbt2OcsO/opT1aIXhSS4f4qfx1k+uI5t8SjRxk9S2QdB04t89/1O/w1cDnyilFU=';
 
-// ── 城市對照 ──
+// ── 儲存：當天訂單（key=訂單編號, value=訂單資料）──
+// 格式: { [date]: { [orderId]: orderObj | null(取消) } }
+const dailyOrders = {};
+
+// ── 計時器：2分鐘後發簡表 ──
+const pendingTimers = {}; // key=groupId+date
+
+// ── 是否有異動（取消/改派/拉回）──
+const hasChanges = {}; // key=date, value=true/false
+
+// ── 23:50 定時發送 ──
+let lastScheduledDate = '';
+
+// ════════════════════════════════════════
+// 地點解析（完整版）
+// ════════════════════════════════════════
 const CITY_MAP = {
   '台北市':'台北','臺北市':'台北','新北市':'新北','桃園市':'桃園',
   '台中市':'台中','臺中市':'台中','台南市':'台南','臺南市':'台南',
@@ -53,16 +68,15 @@ const DIST_MAP = {
   '礁溪鄉':'礁溪','羅東鎮':'羅東','頭城鎮':'頭城','蘇澳鎮':'蘇澳','冬山鄉':'冬山',
   '五結鄉':'五結','員山鄉':'員山','壯圍鄉':'壯圍','南澳鄉':'南澳',
   '花蓮市':'花蓮市','吉安鄉':'吉安','壽豐鄉':'壽豐','鳳林鎮':'鳳林','玉里鎮':'玉里',
-  '台東市':'台東市','臺東市':'台東市','成功鎮':'成功','關山鎮':'關山','鹿野鄉':'鹿野','池上鄉':'池上',
-  '苗栗市':'苗栗市','竹南鎮':'竹南','頭份市':'頭份','苑裡鎮':'苑裡','通霄鎮':'通霄','三義鄉':'三義',
-  '彰化市':'彰化市','鹿港鎮':'鹿港','和美鎮':'和美','員林市':'員林','溪湖鎮':'溪湖','北斗鎮':'北斗',
-  '南投市':'南投市','草屯鎮':'草屯','埔里鎮':'埔里','竹山鎮':'竹山','集集鎮':'集集',
-  '斗六市':'斗六','虎尾鎮':'虎尾','西螺鎮':'西螺','北港鎮':'北港','斗南鎮':'斗南',
-  '朴子市':'朴子','民雄鄉':'民雄','大林鎮':'大林','布袋鎮':'布袋',
-  '屏東市':'屏東市','潮州鎮':'潮州','東港鎮':'東港','恆春鎮':'恆春','內埔鄉':'內埔',
+  '台東市':'台東市','臺東市':'台東市','成功鎮':'成功','關山鎮':'關山',
+  '鹿野鄉':'鹿野','池上鄉':'池上',
+  '苗栗市':'苗栗市','竹南鎮':'竹南','頭份市':'頭份','苑裡鎮':'苑裡','三義鄉':'三義',
+  '彰化市':'彰化市','鹿港鎮':'鹿港','和美鎮':'和美','員林市':'員林','溪湖鎮':'溪湖',
+  '南投市':'南投市','草屯鎮':'草屯','埔里鎮':'埔里','竹山鎮':'竹山',
+  '斗六市':'斗六','虎尾鎮':'虎尾','西螺鎮':'西螺','北港鎮':'北港',
+  '朴子市':'朴子','民雄鄉':'民雄','大林鎮':'大林',
+  '屏東市':'屏東市','潮州鎮':'潮州','東港鎮':'東港','恆春鎮':'恆春',
 };
-
-const AMBIGUOUS = new Set(['東區','西區','南區','北區','中區','仁愛區','安樂區']);
 
 const REMARK_RULES = [
   { keys: ['舉牌','举牌','sign','placard'], label: '舉牌' },
@@ -103,6 +117,16 @@ function splitBlocks(text) {
   return blocks.filter(b => b.match(/結算價/));
 }
 
+function extractOrderId(block) {
+  // 抓訂單編號（英數字組合，通常在第二行）
+  const lines = block.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  for (const l of lines) {
+    const m = l.match(/^([A-Z]{2,3}\d{6,9}|[A-Z0-9]{8,12})$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 function extractTime(block) {
   let m = block.match(/出發日期[：:]\s*[\d/]+\s+(\d{1,2}:\d{2})/);
   if (m) return m[1];
@@ -115,7 +139,7 @@ function extractTime(block) {
 
 function extractDate(block) {
   const m = block.match(/出發日期[：:]\s*([\d/]+)/);
-  return m ? m[1] : '';
+  return m ? m[1] : null;
 }
 
 function extractPrice(block) {
@@ -158,70 +182,69 @@ function detectRemarks(block) {
   return found;
 }
 
-function toMin(t) { const [h,m]=t.split(':').map(Number); return h*60+m; }
-function fmtP(p) { return p%1===0 ? String(p) : p.toFixed(1); }
-
-function convertToSummary(text) {
+function parseOrders(text) {
   const blocks = splitBlocks(text);
-  if (!blocks.length) return null;
-
-  const orders = [];
+  const results = [];
   const seen = new Set();
-  let date = '';
-
   blocks.forEach(b => {
     const time  = extractTime(b);
     const price = extractPrice(b);
+    const orderId = extractOrderId(b);
     if (!time || !price) return;
-    const key = `${time}|${price}`;
+    const key = orderId || `${time}|${price}`;
     if (seen.has(key)) return;
     seen.add(key);
-    if (!date) date = extractDate(b);
     const paxM = b.match(/乘車人數[：:]\s*(\d+)/);
     const pax  = paxM ? parseInt(paxM[1]) : 1;
     const type = extractType(b);
     const loc  = extractLocation(b, type);
     const remarks = detectRemarks(b);
-    orders.push({ time, pax, price, loc, type, remarks });
+    const date = extractDate(b);
+    results.push({ orderId, time, pax, price, loc, type, remarks, date });
   });
+  return results;
+}
 
-  if (!orders.length) return null;
-  orders.sort((a,b) => toMin(a.time) - toMin(b.time));
+function toMin(t) { const [h,m]=t.split(':').map(Number); return h*60+m; }
+function fmtP(p) { return p%1===0 ? String(p) : p.toFixed(1); }
+
+function buildSummary(date, orders) {
+  const active = Object.values(orders).filter(o => o !== null);
+  if (!active.length) return null;
+  active.sort((a,b) => toMin(a.time) - toMin(b.time));
 
   const kesuList = [];
   const otherCount = {};
-  orders.forEach(o => o.remarks.forEach(r => {
+  active.forEach(o => o.remarks.forEach(r => {
     if (r.startsWith('客收')) kesuList.push(r);
     else otherCount[r] = (otherCount[r]||0) + 1;
   }));
 
   let total = 0;
-  const lines = [date];
-  orders.forEach((o, i) => {
+  const lines = [date + (hasChanges[date] ? '（更新）' : '')];
+  active.forEach((o, i) => {
     total += o.price;
     const rStr = o.remarks.length ? o.remarks.join('、')+'，' : '';
     const locStr = o.type === '接' ? `接${o.loc}` : `${o.loc}送`;
     lines.push(`${i+1}。${o.time}，${locStr}，${rStr}${o.pax}人，${fmtP(o.price)}`);
   });
-
   const parts = [];
   if (kesuList.length) parts.push(kesuList.join('、'));
   Object.entries(otherCount).forEach(([k,v]) => parts.push(k+'*'+v));
   lines.push('結：' + fmtP(total) + (parts.length ? '，'+parts.join('、') : ''));
-
   return lines.join('\n');
 }
 
-// ── LINE Webhook ──
-app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
-
-function verifySignature(req) {
-  const sig = req.headers['x-line-signature'];
-  if (!sig) return false;
-  const hash = crypto.createHmac('sha256', CHANNEL_SECRET).update(req.rawBody).digest('base64');
-  return hash === sig;
+// ════════════════════════════════════════
+// LINE API
+// ════════════════════════════════════════
+async function pushMessage(groupId, text) {
+  await axios.post('https://api.line.me/v2/bot/message/push', {
+    to: groupId,
+    messages: [{ type: 'text', text }]
+  }, {
+    headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}` }
+  });
 }
 
 async function replyMessage(replyToken, text) {
@@ -233,6 +256,54 @@ async function replyMessage(replyToken, text) {
   });
 }
 
+// 2分鐘後發簡表
+function scheduleFlush(groupId, date) {
+  const key = groupId + '|' + date;
+  if (pendingTimers[key]) clearTimeout(pendingTimers[key]);
+  pendingTimers[key] = setTimeout(async () => {
+    delete pendingTimers[key];
+    const orders = dailyOrders[date];
+    if (!orders) return;
+    const summary = buildSummary(date, orders);
+    if (summary) await pushMessage(groupId, summary);
+  }, 2 * 60 * 1000); // 2分鐘
+}
+
+// ════════════════════════════════════════
+// Webhook
+// ════════════════════════════════════════
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+
+function verifySignature(req) {
+  const sig = req.headers['x-line-signature'];
+  if (!sig) return false;
+  const hash = crypto.createHmac('sha256', CHANNEL_SECRET).update(req.rawBody).digest('base64');
+  return hash === sig;
+}
+
+// 每分鐘檢查是否到23:50
+setInterval(async () => {
+  const now = new Date();
+  const h = now.getHours();
+  const m = now.getMinutes();
+  const dateStr = `${now.getMonth()+1}/${now.getDate()}`;
+  if (h === 23 && m === 50 && lastScheduledDate !== dateStr) {
+    lastScheduledDate = dateStr;
+    // 發當天有異動的簡表
+    if (hasChanges[dateStr] && dailyOrders[dateStr]) {
+      for (const groupId of Object.keys(groupIds)) {
+        const summary = buildSummary(dateStr, dailyOrders[dateStr]);
+        if (summary) await pushMessage(groupId, summary);
+      }
+    }
+  }
+}, 60 * 1000);
+
+// 記錄群組ID
+const groupIds = {};
+
 app.post('/webhook', async (req, res) => {
   if (!verifySignature(req)) return res.status(403).send('Forbidden');
   res.sendStatus(200);
@@ -240,17 +311,109 @@ app.post('/webhook', async (req, res) => {
   const events = req.body.events || [];
   for (const event of events) {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
-    const text = event.message.text;
-    // 只有包含訂單關鍵字才處理
-    if (!text.match(/結算價/) && !text.match(/出發日期/)) continue;
-    const summary = convertToSummary(text);
-    if (summary) {
-      await replyMessage(event.replyToken, summary);
+
+    const text = event.message.text.trim();
+    const sourceId = event.source.groupId || event.source.userId;
+    if (!sourceId) continue;
+    groupIds[sourceId] = true;
+
+    // ── 1. 取消：「XXX 訂單取消」或「XXX 取消」──
+    const cancelM = text.match(/([A-Z0-9]{6,12})\s*(訂單取消|取消)/);
+    if (cancelM) {
+      const orderId = cancelM[1];
+      for (const date of Object.keys(dailyOrders)) {
+        if (dailyOrders[date][orderId] !== undefined) {
+          dailyOrders[date][orderId] = null;
+          hasChanges[date] = true;
+          scheduleFlush(sourceId, date);
+          break;
+        }
+      }
+      continue;
+    }
+
+    // ── 2. 拉回改派：「拉回改派 XXXX」→ 先移除，等新訂單進來 ──
+    const pullReassignM = text.match(/拉回改派\s*([A-Z0-9]{6,12})/);
+    if (pullReassignM) {
+      const orderId = pullReassignM[1];
+      for (const date of Object.keys(dailyOrders)) {
+        if (dailyOrders[date][orderId] !== undefined) {
+          dailyOrders[date][orderId] = null;
+          hasChanges[date] = true;
+          scheduleFlush(sourceId, date);
+          break;
+        }
+      }
+      continue;
+    }
+
+    // ── 3. 改派：「XXX 改派」+ 新訂單內容 ──
+    const reassignM = text.match(/([A-Z0-9]{6,12})\s*改派/);
+    if (reassignM) {
+      const oldId = reassignM[1];
+      for (const date of Object.keys(dailyOrders)) {
+        if (dailyOrders[date][oldId] !== undefined) {
+          dailyOrders[date][oldId] = null;
+          hasChanges[date] = true;
+          break;
+        }
+      }
+      const newOrders = parseOrders(text);
+      for (const o of newOrders) {
+        const date = o.date || getTodayStr();
+        if (!dailyOrders[date]) dailyOrders[date] = {};
+        const key = o.orderId || `${o.time}|${o.price}`;
+        dailyOrders[date][key] = o;
+        hasChanges[date] = true;
+      }
+      const date = newOrders[0]?.date || getTodayStr();
+      scheduleFlush(sourceId, date);
+      continue;
+    }
+
+    // ── 4. 拉回：「XXX 拉回」或「XXX ...拉回」或「我先拉回」──
+    const pullbackM = text.match(/([A-Z0-9]{6,12})[^\n]*拉回/) || text.match(/拉回/);
+    if (pullbackM) {
+      if (pullbackM[1]) {
+        const orderId = pullbackM[1];
+        for (const date of Object.keys(dailyOrders)) {
+          if (dailyOrders[date][orderId] !== undefined) {
+            dailyOrders[date][orderId] = null;
+            hasChanges[date] = true;
+            scheduleFlush(sourceId, date);
+            break;
+          }
+        }
+      }
+      continue;
+    }
+
+    // ── 5. 航班通知（忽略，不影響簡表）──
+    if (text.match(/([A-Z0-9]{6,12})\s*航班/) || text.match(/航班預計|航班延誤|航班取消/)) {
+      continue;
+    }
+
+    // ── 6. 新訂單 ──
+    if (text.match(/結算價/) && text.match(/出發日期/)) {
+      const newOrders = parseOrders(text);
+      for (const o of newOrders) {
+        const date = o.date || getTodayStr();
+        if (!dailyOrders[date]) dailyOrders[date] = {};
+        const key = o.orderId || `${o.time}|${o.price}`;
+        dailyOrders[date][key] = o;
+      }
+      const date = newOrders[0]?.date || getTodayStr();
+      scheduleFlush(sourceId, date);
     }
   }
 });
 
-app.get('/', (req, res) => res.send('訂單簡表 Bot 運行中'));
+function getTodayStr() {
+  const now = new Date();
+  return `${now.getMonth()+1}/${now.getDate()}`;
+}
+
+app.get('/', (req, res) => res.send('訂單簡表 Bot 運行中 ✅'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
