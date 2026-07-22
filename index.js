@@ -11,7 +11,7 @@ const CHANNEL_ACCESS_TOKEN = 't7lUw3SX7cQVJpH5NthljqiLL5mBWCK9bFL1fam+ow99XRyrRK
 // 格式: { [date]: { [orderId]: orderObj | null(取消) } }
 const dailyOrders = {};
 
-// ── 計時器：5分鐘後發簡表 ──
+// ── 計時器：2分鐘後發簡表 ──
 const pendingTimers = {}; // key=groupId+date
 
 // ── 是否有異動（取消/改派/拉回）──
@@ -108,11 +108,7 @@ function splitBlocks(text) {
   let cur = [];
   for (const l of lines) {
     const t = l.trim().replace(/^["""「]/, '');
-    // 新訂單開頭：車型（九座送機）或 純訂單編號行（NFZ515768）
-    const isNewBlock =
-      t.match(/^([一二三四五六七八九十\d]+座|經五|商務|轎車|休旅|廂型)\s*(送機|接機)/) ||
-      (t.match(/^[A-Z0-9]{6,15}$/) && cur.length > 0 && !cur.join('').includes('結算價'));
-    if (isNewBlock && cur.length > 0) {
+    if (t.match(/^([一二三四五六七八九十\d]+座|經五|商務|轎車|休旅|廂型)\s*(送機|接機)/) && cur.length > 0) {
       blocks.push(cur.join('\n'));
       cur = [l];
     } else { cur.push(l); }
@@ -147,27 +143,14 @@ function extractDate(block) {
 }
 
 function extractPrice(block) {
-  const m = block.match(/結算價[：:\s]*([\d,]+\.?\d*)/);
-  if (!m) return null;
-  return parseFloat(m[1].replace(/,/g, ''));
+  const m = block.match(/結算價[：:\s]*([\d.]+)/);
+  return m ? parseFloat(m[1]) : null;
 }
 
 function extractType(block) {
-  const lines = block.split('\n').map(l=>l.trim()).filter(l=>l.length>0);
-  // 先從第一行找車型
-  const first = lines[0] || '';
+  const first = block.split('\n').map(l=>l.trim()).find(l=>l.length>0) || '';
   if (first.includes('接機')) return '接';
   if (first.includes('送機')) return '送';
-  // 從任何一行找接機/送機關鍵字
-  for (const l of lines) {
-    if (l.includes('接機')) return '接';
-    if (l.includes('送機')) return '送';
-  }
-  // 從下車地點判斷
-  const toM = block.match(/下車地點[：:]\s*(.+)/);
-  if (toM && toM[1].match(/機場|桃機/)) return '送';
-  const fromM = block.match(/上車地點[：:]\s*(.+)/);
-  if (fromM && fromM[1].match(/機場|桃機/)) return '接';
   return '接';
 }
 
@@ -273,7 +256,7 @@ async function replyMessage(replyToken, text) {
   });
 }
 
-// 5分鐘後發簡表
+// 2分鐘後發簡表
 function scheduleFlush(groupId, date) {
   const key = groupId + '|' + date;
   if (pendingTimers[key]) clearTimeout(pendingTimers[key]);
@@ -283,7 +266,7 @@ function scheduleFlush(groupId, date) {
     if (!orders) return;
     const summary = buildSummary(date, orders);
     if (summary) await pushMessage(groupId, summary);
-  }, 5 * 60 * 1000); // 5分鐘
+  }, 2 * 60 * 1000); // 2分鐘
 }
 
 // ════════════════════════════════════════
