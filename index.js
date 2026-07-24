@@ -91,7 +91,7 @@ function getCity(addr) {
 }
 
 function parseAddr(addr) {
-  if (!addr || addr.match(/^桃園機場|^桃機|^機場/i)) return null;
+  if (!addr || addr.match(/^桃園機場|^桃機|^機場|^松山機場/i)) return null;
   const city = getCity(addr);
   const distKeys = Object.keys(DIST_MAP).sort((a,b) => b.length - a.length);
   for (const k of distKeys) {
@@ -102,13 +102,30 @@ function parseAddr(addr) {
   return city || null;
 }
 
+// 用於交通趟：沒有明確城市時，不強加「台北」，只回傳區名
+function parseAddrNoDefault(addr) {
+  if (!addr) return null;
+  const city = getCity(addr);
+  const distKeys = Object.keys(DIST_MAP).sort((a,b) => b.length - a.length);
+  for (const k of distKeys) {
+    if (addr.includes(k)) return (city || '') + DIST_MAP[k];
+  }
+  const m = addr.match(/[市縣]([^\s市縣，,\/\d]{2,3})[區鄉鎮市]/);
+  if (m) return (city || '') + m[1];
+  return city || addr.substring(0, 6);
+}
+
 function splitBlocks(text) {
   const lines = text.split('\n');
   const blocks = [];
   let cur = [];
   for (const l of lines) {
     const t = l.trim().replace(/^["""「]/, '');
-    if (t.match(/^([一二三四五六七八九十\d]+座|經五|商務|轎車|休旅|廂型)\s*(送機|接機)/) && cur.length > 0) {
+    // 新訂單開頭：車型（九座送機）或 純訂單編號行（NFZ515768）
+    const isNewBlock =
+      t.match(/^([一二三四五六七八九十\d]+座|經五|商務|轎車|休旅|廂型)\s*(送機|接機)/) ||
+      (t.match(/^[A-Z0-9]{6,15}$/) && cur.length > 0 && !cur.join('').includes('結算價'));
+    if (isNewBlock && cur.length > 0) {
       blocks.push(cur.join('\n'));
       cur = [l];
     } else { cur.push(l); }
@@ -143,14 +160,27 @@ function extractDate(block) {
 }
 
 function extractPrice(block) {
-  const m = block.match(/結算價[：:\s]*([\d.]+)/);
-  return m ? parseFloat(m[1]) : null;
+  const m = block.match(/結算價[：:\s]*([\d,]+\.?\d*)/);
+  if (!m) return null;
+  return parseFloat(m[1].replace(/,/g, ''));
 }
 
 function extractType(block) {
-  const first = block.split('\n').map(l=>l.trim()).find(l=>l.length>0) || '';
+  const lines = block.split('\n').map(l=>l.trim()).filter(l=>l.length>0);
+  // 先從第一行找車型
+  const first = lines[0] || '';
   if (first.includes('接機')) return '接';
   if (first.includes('送機')) return '送';
+  // 從任何一行找接機/送機關鍵字
+  for (const l of lines) {
+    if (l.includes('接機')) return '接';
+    if (l.includes('送機')) return '送';
+  }
+  // 從下車地點判斷
+  const toM = block.match(/下車地點[：:]\s*(.+)/);
+  if (toM && toM[1].match(/機場|桃機|松山機場/)) return '送';
+  const fromM = block.match(/上車地點[：:]\s*(.+)/);
+  if (fromM && fromM[1].match(/機場|桃機|松山機場/)) return '接';
   return '接';
 }
 
@@ -159,7 +189,7 @@ function extractLocation(block, type) {
   const alt  = type === '接' ? '上車地點' : '下車地點';
   const m1 = block.match(new RegExp(main + '[：:]\\s*(.+)'));
   let addr = m1 ? m1[1].trim() : '';
-  if (!addr || addr.match(/桃園機場|桃機|機場t/i)) {
+  if (!addr || addr.match(/桃園機場|桃機|機場t|松山機場|松山機/i)) {
     const m2 = block.match(new RegExp(alt + '[：:]\\s*(.+)'));
     addr = m2 ? m2[1].trim() : '';
   }
@@ -182,15 +212,178 @@ function detectRemarks(block) {
   return found;
 }
 
+// ════════════════════════════════════════
+// 外車格式二：S99交通趟（非機場，兩地之間）
+// ════════════════════════════════════════
+function parseTransferOrder(text) {
+  if (!text.match(/用車日期/) || !text.match(/搭車地區/)) return null;
+  const dateM = text.match(/用車日期[：:]\s*([\d/]+)/);
+  const timeM = text.match(/出發時間[：:]\s*(\d{1,2}:\d{2})/);
+  const fromM = text.match(/搭車地區[：:]\s*(.+)/);
+  const toM   = text.match(/下車地區[：:]\s*(.+)/);
+  const paxM  = text.match(/乘車人數[：:]\s*(.+)/);
+  const priceM = text.match(/需付車資[：:]\s*(\d+)/);
+  if (!timeM) return null;
+
+  const fromLoc = fromM ? parseAddrNoDefault(fromM[1].trim()) : null;
+  const toLoc   = toM ? parseAddrNoDefault(toM[1].trim()) : null;
+  const pax = paxM ? paxM[1].trim().replace(/\s/g,'') : '1人';
+  const price = priceM ? parseFloat(priceM[1]) : null;
+
+  return {
+    orderId: null,
+    time: timeM[1],
+    pax: pax,
+    price: price,
+    loc: `${fromLoc||'?'}→${toLoc||'?'}`,
+    type: 'transfer',
+    remarks: [],
+    date: dateM ? dateM[1] : null,
+  };
+}
+
+// ════════════════════════════════════════
+// 外車格式三：送機_桃園機場（駕駛回報格式）
+// ════════════════════════════════════════
+function parseDriverReportOrder(text) {
+  if (!text.match(/時間[：:]/) || !text.match(/貴賓[：:]/)) return null;
+  const timeM = text.match(/時間[：:]\s*[\d\/]+_(\d{1,2}:\d{2})/) || text.match(/時間[：:].*?(\d{1,2}:\d{2})/);
+  const addrM = text.match(/地址[：:]\s*(.+)/);
+  const paxM  = text.match(/人數行李[：:]\s*(\d+)\s*位/);
+  const isReturn = text.match(/送機/);
+
+  if (!timeM) return null;
+  const loc = addrM ? parseAddr(addrM[1].trim()) : null;
+  const pax = paxM ? parseInt(paxM[1]) : 1;
+
+  // 備注：優先抓括號內容（若不會太長），否則抓整段
+  const remarkM = text.match(/備註[：:]\s*(.+)/);
+  const remarks = [];
+  if (remarkM && remarkM[1].trim() && remarkM[1].trim() !== '-') {
+    const raw = remarkM[1].trim();
+    const bracketM = raw.match(/\(([^)]+)\)/);
+    if (bracketM && bracketM[1].length <= 12) {
+      remarks.push(bracketM[1]);
+    } else {
+      // 取括號前的文字，或整段（若無括號）
+      const beforeBracket = raw.split('(')[0].trim();
+      remarks.push(beforeBracket || raw);
+    }
+  }
+
+  return {
+    orderId: null,
+    time: timeM[1],
+    pax: pax,
+    price: null, // 待確認金額
+    loc: loc || '',
+    type: isReturn ? '送' : '接',
+    remarks,
+    date: null,
+  };
+}
+
+// ════════════════════════════════════════
+// 外車格式四/五：Tab分隔表格（平安鑫）
+// ════════════════════════════════════════
+function parseTableOrder(text) {
+  if (!text.includes('\t')) return null;
+  let cols = text.split('\t').map(c => c.trim());
+  if (cols.length < 14) return null;
+
+  // 若第一欄是空的（信用卡趟格式多一個空白欄），往後位移
+  // 用「TRUE」欄位當錨點定位，因為它固定存在且獨特
+  const trueIdx = cols.findIndex(c => c === 'TRUE');
+  if (trueIdx === -1) return null;
+
+  // 錨點前：找金額（往前找第一個含數字的非空欄位）
+  let price = null;
+  for (let i = trueIdx - 1; i >= 0; i--) {
+    const c = cols[i];
+    if (c && c.match(/\d/)) {
+      const num = c.replace(/[^\d.]/g, '');
+      if (num) { price = parseFloat(num); break; }
+    }
+  }
+  // 錨點後：日期, 訂單編號, 送機/接機, 時間, 車型, 縣, 區, 地址, 目的地, 客戶姓名, 人數...
+  const dateStr   = cols[trueIdx + 1];
+  const orderId   = cols[trueIdx + 2];
+  const typeRaw   = cols[trueIdx + 3];
+  const time      = cols[trueIdx + 4];
+  const county    = cols[trueIdx + 6];
+  const district  = cols[trueIdx + 7];
+  const address   = cols[trueIdx + 8];
+  const paxRaw    = cols[trueIdx + 11];
+
+  if (!time || !time.match(/\d{1,2}:\d{2}/)) return null;
+
+  const pax = parseInt(paxRaw) || 1;
+  const type = typeRaw.includes('接') ? '接' : '送';
+  const addrFull = (county||'') + (district||'') + (address||'');
+  const loc = parseAddr(addrFull) || ((county||'') + (district||'')).replace(/[市縣]/g,'').replace(/區$/,'');
+
+  // 備注：找表格尾端括號內容，排除固定安全宣導語
+  const remarks = [];
+  const tailText = cols.slice(trueIdx + 12).join(' ');
+  const noteM = tailText.match(/\(([^)]+)\)/);
+  if (noteM) remarks.push(noteM[1]);
+
+  return {
+    orderId,
+    time,
+    pax,
+    price,
+    loc,
+    type,
+    remarks,
+    date: dateStr,
+  };
+}
+
+// ════════════════════════════════════════
+// 外車格式一：xxx接機/送機（欄位與一般訂單相同，日期格式不同）
+// 共用 extractType / extractLocation / extractPrice / detectRemarks
+// 差異：日期可能是 2026/07/23 格式，時間需從航班編號抓
+// ════════════════════════════════════════
+function extractTimeV2(block) {
+  // 先試原本邏輯
+  const t1 = extractTime(block);
+  if (t1) return t1;
+  // 【CX565】18:15 這種格式：時間在】後面
+  const m = block.match(/【[^】]+】\s*(\d{1,2}:\d{2})/);
+  if (m) return m[1];
+  return null;
+}
+
+function extractPriceV2(block) {
+  const p1 = extractPrice(block);
+  if (p1 !== null) return p1;
+  // 結算價 ：1800$ 這種格式
+  const m = block.match(/結算價[：:\s]*([\d,]+\.?\d*)\s*\$?/);
+  if (m) return parseFloat(m[1].replace(/,/g,''));
+  return null;
+}
+
 function parseOrders(text) {
+  // 先偵測特殊格式
+  const transferOrder = parseTransferOrder(text);
+  if (transferOrder) return [transferOrder];
+
+  const driverReportOrder = parseDriverReportOrder(text);
+  if (driverReportOrder) return [driverReportOrder];
+
+  const tableOrder = parseTableOrder(text);
+  if (tableOrder) return [tableOrder];
+
+  // 一般訂單 / 外車格式一（共用邏輯）
   const blocks = splitBlocks(text);
   const results = [];
   const seen = new Set();
   blocks.forEach(b => {
-    const time  = extractTime(b);
-    const price = extractPrice(b);
+    const time  = extractTimeV2(b);
+    const price = extractPriceV2(b);
     const orderId = extractOrderId(b);
-    if (!time || !price) return;
+    if (!time || price === null) return;
     const key = orderId || `${time}|${price}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -217,21 +410,36 @@ function buildSummary(date, orders) {
   const otherCount = {};
   active.forEach(o => o.remarks.forEach(r => {
     if (r.startsWith('客收')) kesuList.push(r);
-    else otherCount[r] = (otherCount[r]||0) + 1;
+    else if (['舉牌','兒童座椅','增高墊'].includes(r)) otherCount[r] = (otherCount[r]||0) + 1;
+    // 自由文字備注（格式四五）不列入結尾統計，只顯示在該筆
   }));
 
   let total = 0;
+  let hasUnconfirmed = false;
   const lines = [date + (hasChanges[date] ? '（更新）' : '')];
   active.forEach((o, i) => {
-    total += o.price;
+    const priceStr = (o.price === null || o.price === undefined) ? '待確認金額' : fmtP(o.price);
+    if (o.price === null || o.price === undefined) hasUnconfirmed = true;
+    else total += o.price;
+
     const rStr = o.remarks.length ? o.remarks.join('、')+'，' : '';
-    const locStr = o.type === '接' ? `接${o.loc}` : `${o.loc}送`;
-    lines.push(`${i+1}。${o.time}，${locStr}，${rStr}${o.pax}人，${fmtP(o.price)}`);
+
+    let locStr;
+    if (o.type === 'transfer') {
+      locStr = `交通趟，${o.loc}`;
+    } else if (o.type === '接') {
+      locStr = `接${o.loc}`;
+    } else {
+      locStr = `${o.loc}送`;
+    }
+
+    lines.push(`${i+1}。${o.time}，${locStr}，${rStr}${o.pax}${typeof o.pax === 'string' && o.pax.includes('人') ? '' : '人'}，${priceStr}`);
   });
   const parts = [];
   if (kesuList.length) parts.push(kesuList.join('、'));
   Object.entries(otherCount).forEach(([k,v]) => parts.push(k+'*'+v));
-  lines.push('結：' + fmtP(total) + (parts.length ? '，'+parts.join('、') : ''));
+  const totalStr = fmtP(total) + (hasUnconfirmed ? '+待確認' : '');
+  lines.push('結：' + totalStr + (parts.length ? '，'+parts.join('、') : ''));
   return lines.join('\n');
 }
 
@@ -256,7 +464,7 @@ async function replyMessage(replyToken, text) {
   });
 }
 
-// 2分鐘後發簡表
+// 5分鐘後發簡表
 function scheduleFlush(groupId, date) {
   const key = groupId + '|' + date;
   if (pendingTimers[key]) clearTimeout(pendingTimers[key]);
@@ -266,7 +474,7 @@ function scheduleFlush(groupId, date) {
     if (!orders) return;
     const summary = buildSummary(date, orders);
     if (summary) await pushMessage(groupId, summary);
-  }, 2 * 60 * 1000); // 2分鐘
+  }, 5 * 60 * 1000); // 5分鐘
 }
 
 // ════════════════════════════════════════
@@ -360,13 +568,13 @@ app.post('/webhook', async (req, res) => {
       }
       const newOrders = parseOrders(text);
       for (const o of newOrders) {
-        const date = o.date || getTodayStr();
+        const date = normalizeDate(o.date);
         if (!dailyOrders[date]) dailyOrders[date] = {};
-        const key = o.orderId || `${o.time}|${o.price}`;
+        const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
         dailyOrders[date][key] = o;
         hasChanges[date] = true;
       }
-      const date = newOrders[0]?.date || getTodayStr();
+      const date = normalizeDate(newOrders[0]?.date);
       scheduleFlush(sourceId, date);
       continue;
     }
@@ -393,17 +601,23 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
-    // ── 6. 新訂單 ──
-    if (text.match(/結算價/) && text.match(/出發日期/)) {
+    // ── 6. 新訂單（一般訂單、外車格式一二三四五）──
+    const looksLikeOrder =
+      (text.match(/結算價/) && text.match(/出發日期/)) ||   // 一般訂單/外車格式一
+      (text.match(/用車日期/) && text.match(/搭車地區/)) ||  // 外車格式二
+      (text.match(/時間[：:]/) && text.match(/貴賓[：:]/)) || // 外車格式三
+      (text.includes('\t') && text.split('\t').length >= 15); // 外車格式四五
+
+    if (looksLikeOrder) {
       const newOrders = parseOrders(text);
       for (const o of newOrders) {
-        const date = o.date || getTodayStr();
+        const date = normalizeDate(o.date);
         if (!dailyOrders[date]) dailyOrders[date] = {};
-        const key = o.orderId || `${o.time}|${o.price}`;
+        const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
         dailyOrders[date][key] = o;
       }
-      const date = newOrders[0]?.date || getTodayStr();
-      scheduleFlush(sourceId, date);
+      const date = normalizeDate(newOrders[0]?.date);
+      if (newOrders.length) scheduleFlush(sourceId, date);
     }
   }
 });
@@ -411,6 +625,16 @@ app.post('/webhook', async (req, res) => {
 function getTodayStr() {
   const now = new Date();
   return `${now.getMonth()+1}/${now.getDate()}`;
+}
+
+// 統一日期格式為 M/D（處理 2026-06-27、2026/07/23、7/21 等格式）
+function normalizeDate(dateStr) {
+  if (!dateStr) return getTodayStr();
+  const m = dateStr.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (m) return `${parseInt(m[2])}/${parseInt(m[3])}`;
+  const m2 = dateStr.match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m2) return dateStr;
+  return getTodayStr();
 }
 
 app.get('/', (req, res) => res.send('訂單簡表 Bot 運行中 ✅'));
