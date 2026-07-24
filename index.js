@@ -138,7 +138,7 @@ function extractOrderId(block) {
   // 抓訂單編號（英數字組合，通常在第二行）
   const lines = block.split('\n').map(l => l.trim()).filter(l => l.length > 0);
   for (const l of lines) {
-    const m = l.match(/^([A-Z]{2,3}\d{6,9}|[A-Z0-9]{8,12})$/);
+    const m = l.match(/^([A-Z]{2,3}\d{6,9}|[A-Z0-9]{6,15})$/);
     if (m) return m[1];
   }
   return null;
@@ -526,7 +526,7 @@ app.post('/webhook', async (req, res) => {
     groupIds[sourceId] = true;
 
     // ── 1. 取消：「XXX 訂單取消」或「XXX 取消」──
-    const cancelM = text.match(/([A-Z0-9]{6,12})\s*(訂單取消|取消)/);
+    const cancelM = text.match(/([A-Z0-9]{6,15})\s*(訂單取消|取消)/);
     if (cancelM) {
       const orderId = cancelM[1];
       for (const date of Object.keys(dailyOrders)) {
@@ -541,7 +541,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── 2. 拉回改派：「拉回改派 XXXX」→ 先移除，等新訂單進來 ──
-    const pullReassignM = text.match(/拉回改派\s*([A-Z0-9]{6,12})/);
+    const pullReassignM = text.match(/拉回改派\s*([A-Z0-9]{6,15})/);
     if (pullReassignM) {
       const orderId = pullReassignM[1];
       for (const date of Object.keys(dailyOrders)) {
@@ -556,7 +556,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── 3. 改派：「XXX 改派」+ 新訂單內容 ──
-    const reassignM = text.match(/([A-Z0-9]{6,12})\s*改派/);
+    const reassignM = text.match(/([A-Z0-9]{6,15})\s*改派/);
     if (reassignM) {
       const oldId = reassignM[1];
       for (const date of Object.keys(dailyOrders)) {
@@ -580,7 +580,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── 4. 拉回：「XXX 拉回」或「XXX ...拉回」或「我先拉回」──
-    const pullbackM = text.match(/([A-Z0-9]{6,12})[^\n]*拉回/) || text.match(/拉回/);
+    const pullbackM = text.match(/([A-Z0-9]{6,15})[^\n]*拉回/) || text.match(/拉回/);
     if (pullbackM) {
       if (pullbackM[1]) {
         const orderId = pullbackM[1];
@@ -597,7 +597,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── 5. 航班通知（忽略，不影響簡表）──
-    if (text.match(/([A-Z0-9]{6,12})\s*航班/) || text.match(/航班預計|航班延誤|航班取消/)) {
+    if (text.match(/([A-Z0-9]{6,15})\s*航班/) || text.match(/航班預計|航班延誤|航班取消/)) {
       continue;
     }
 
