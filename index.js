@@ -17,8 +17,8 @@ const pendingTimers = {}; // key=groupId+date
 // ── 是否有異動（取消/改派/拉回）──
 const hasChanges = {}; // key=date, value=true/false
 
-// ── 23:50 定時發送 ──
-let lastScheduledDate = '';
+// ── 記錄每個群組最近一次訂單的日期，供無日期訊息（補單/交通車）歸類 ──
+const lastActiveDate = {}; // key=groupId, value=date string
 
 // ════════════════════════════════════════
 // 地點解析（完整版）
@@ -408,16 +408,29 @@ function buildSummary(date, orders) {
 
   const kesuList = [];
   const otherCount = {};
-  active.forEach(o => o.remarks.forEach(r => {
-    if (r.startsWith('客收')) kesuList.push(r);
-    else if (['舉牌','兒童座椅','增高墊'].includes(r)) otherCount[r] = (otherCount[r]||0) + 1;
-    // 自由文字備注（格式四五）不列入結尾統計，只顯示在該筆
-  }));
+  active.forEach(o => {
+    if (o.isPlaceholder || o.isShuttle) return;
+    o.remarks.forEach(r => {
+      if (r.startsWith('客收')) kesuList.push(r);
+      else if (['舉牌','兒童座椅','增高墊'].includes(r)) otherCount[r] = (otherCount[r]||0) + 1;
+    });
+  });
 
   let total = 0;
   let hasUnconfirmed = false;
   const lines = [date + (hasChanges[date] ? '（更新）' : '')];
   active.forEach((o, i) => {
+    // 補單佔位
+    if (o.isPlaceholder) {
+      lines.push(`${i+1}。${o.display}`);
+      return;
+    }
+    // 交通車
+    if (o.isShuttle) {
+      lines.push(`${i+1}。${o.time}，${o.display}`);
+      return;
+    }
+
     const priceStr = (o.price === null || o.price === undefined) ? '待確認金額' : fmtP(o.price);
     if (o.price === null || o.price === undefined) hasUnconfirmed = true;
     else total += o.price;
@@ -601,6 +614,45 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    // ── 5.5 補單提示：「補12送」「補09接」→ 先佔位，等實際訂單自動取代 ──
+    const placeholderM = text.match(/^補\s*(\d{1,2})\s*(送|接)$/);
+    if (placeholderM) {
+      const hour = parseInt(placeholderM[1]);
+      const type = placeholderM[2];
+      const date = lastActiveDate[sourceId] || getTodayStr();
+      if (!dailyOrders[date]) dailyOrders[date] = {};
+      const key = `placeholder|${hour}|${type}`;
+      dailyOrders[date][key] = {
+        isPlaceholder: true,
+        hour, type,
+        time: `${String(hour).padStart(2,'0')}:00`,
+        display: `補${hour}${type}`,
+      };
+      hasChanges[date] = true;
+      scheduleFlush(sourceId, date);
+      continue;
+    }
+
+    // ── 5.6 交通車通知：「0740 蘆竹交通車」→ 顯示時間+地點，無金額無人數（除非有標註人數）──
+    const shuttleM = text.match(/^(\d{3,4})\s*(.+?交通車)\s*(\d+人)?$/);
+    if (shuttleM) {
+      const timeRaw = shuttleM[1].padStart(4, '0');
+      const time = `${timeRaw.slice(0,2)}:${timeRaw.slice(2)}`;
+      const label = shuttleM[2];
+      const paxNote = shuttleM[3] || '';
+      const date = lastActiveDate[sourceId] || getTodayStr();
+      if (!dailyOrders[date]) dailyOrders[date] = {};
+      const key = `shuttle|${time}|${label}`;
+      dailyOrders[date][key] = {
+        isShuttle: true,
+        time,
+        display: paxNote ? `${label}，${paxNote}` : label,
+      };
+      hasChanges[date] = true;
+      scheduleFlush(sourceId, date);
+      continue;
+    }
+
     // ── 6. 新訂單（一般訂單、外車格式一二三四五）──
     const looksLikeOrder =
       (text.match(/結算價/) && text.match(/出發日期/)) ||   // 一般訂單/外車格式一
@@ -612,7 +664,17 @@ app.post('/webhook', async (req, res) => {
       const newOrders = parseOrders(text);
       for (const o of newOrders) {
         const date = normalizeDate(o.date);
+        lastActiveDate[sourceId] = date; // 記錄最近使用的日期
         if (!dailyOrders[date]) dailyOrders[date] = {};
+
+        // 檢查是否能取代某個補單佔位（同方向 + 同整點時段）
+        const oHour = parseInt(o.time.split(':')[0]);
+        const oType = o.type === '接' ? '接' : '送';
+        const placeholderKey = `placeholder|${oHour}|${oType}`;
+        if (dailyOrders[date][placeholderKey] && dailyOrders[date][placeholderKey].isPlaceholder) {
+          delete dailyOrders[date][placeholderKey];
+        }
+
         const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
         dailyOrders[date][key] = o;
       }
@@ -638,6 +700,12 @@ function normalizeDate(dateStr) {
 }
 
 app.get('/', (req, res) => res.send('訂單簡表 Bot 運行中 ✅'));
+
+// ── 防止 Render 免費方案休眠：每 13 分鐘自我 ping 一次 ──
+const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://order-bot-45x0.onrender.com';
+setInterval(() => {
+  axios.get(SELF_URL).catch(() => {}); // 失敗也沒關係，純粹是為了保持喚醒
+}, 13 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
