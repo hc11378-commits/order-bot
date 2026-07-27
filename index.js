@@ -1,11 +1,12 @@
+require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 
 const app = express();
 
-const CHANNEL_SECRET = 'ce5aafad66d4ea009b1f9ae3046035dd';
-const CHANNEL_ACCESS_TOKEN = 't7lUw3SX7cQVJpH5NthljqiLL5mBWCK9bFL1fam+ow99XRyrRK/2rw+5zxQtV3CmVn5jHGe8wsJFQ8cwHLOi2YAGENNR33yth7rIX6D6qSNDZbt2OcsO/opT1aIXhSS4f4qfx1k+uI5t8SjRxk9S2QdB04t89/1O/w1cDnyilFU=';
+const CHANNEL_SECRET = process.env.CHANNEL_SECRET;
+const CHANNEL_ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN;
 
 // ── 儲存：當天訂單（key=訂單編號, value=訂單資料）──
 // 格式: { [date]: { [orderId]: orderObj | null(取消) } }
@@ -543,6 +544,7 @@ function verifySignature(req) {
 }
 
 // 每分鐘檢查是否到23:50
+let lastScheduledDate = null;
 setInterval(async () => {
   const now = new Date();
   const h = now.getHours();
