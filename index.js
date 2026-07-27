@@ -494,6 +494,27 @@ async function replyMessage(replyToken, text) {
   });
 }
 
+// 尋找訂單所在日期：先精準比對key，找不到再用「去除所有空白後比對」寬鬆比對，
+// 避免因為訂單編號夾帶不可見字元或空白差異導致完全比對失敗
+function findOrderDate(orderId) {
+  const normalizedTarget = orderId.replace(/\s/g, '');
+  for (const date of Object.keys(dailyOrders)) {
+    if (dailyOrders[date][orderId] !== undefined && dailyOrders[date][orderId] !== null) {
+      return { date, key: orderId };
+    }
+  }
+  // 寬鬆比對：去除空白後比較
+  for (const date of Object.keys(dailyOrders)) {
+    for (const key of Object.keys(dailyOrders[date])) {
+      if (dailyOrders[date][key] === null) continue;
+      if (key.replace(/\s/g, '') === normalizedTarget) {
+        return { date, key };
+      }
+    }
+  }
+  return null;
+}
+
 // 5分鐘後發簡表
 function scheduleFlush(groupId, date) {
   const key = groupId + '|' + date;
@@ -550,7 +571,9 @@ app.post('/webhook', async (req, res) => {
   for (const event of events) {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
-    const text = event.message.text.trim();
+    const rawText = event.message.text.trim();
+    // 移除零寬字元、BOM等不可見字元，避免破壞正則比對（常見於手機輸入法/轉發訊息）
+    const text = rawText.replace(/[\u200B-\u200D\uFEFF\u00A0]/g, (ch) => ch === '\u00A0' ? ' ' : '');
     const sourceId = event.source.groupId || event.source.userId;
     if (!sourceId) continue;
     groupIds[sourceId] = true;
@@ -559,13 +582,11 @@ app.post('/webhook', async (req, res) => {
     const cancelM = text.match(/([A-Z0-9]{6,15})\s*(訂單取消|取消)/);
     if (cancelM) {
       const orderId = cancelM[1];
-      for (const date of Object.keys(dailyOrders)) {
-        if (dailyOrders[date][orderId] !== undefined) {
-          dailyOrders[date][orderId] = null;
-          hasChanges[date] = true;
-          scheduleFlush(sourceId, date);
-          break;
-        }
+      const found = findOrderDate(orderId);
+      if (found) {
+        dailyOrders[found.date][found.key] = null;
+        hasChanges[found.date] = true;
+        scheduleFlush(sourceId, found.date);
       }
       continue;
     }
@@ -574,13 +595,11 @@ app.post('/webhook', async (req, res) => {
     const pullReassignM = text.match(/拉回改派\s*([A-Z0-9]{6,15})/);
     if (pullReassignM) {
       const orderId = pullReassignM[1];
-      for (const date of Object.keys(dailyOrders)) {
-        if (dailyOrders[date][orderId] !== undefined) {
-          dailyOrders[date][orderId] = null;
-          hasChanges[date] = true;
-          scheduleFlush(sourceId, date);
-          break;
-        }
+      const found = findOrderDate(orderId);
+      if (found) {
+        dailyOrders[found.date][found.key] = null;
+        hasChanges[found.date] = true;
+        scheduleFlush(sourceId, found.date);
       }
       continue;
     }
@@ -589,12 +608,10 @@ app.post('/webhook', async (req, res) => {
     const reassignM = text.match(/([A-Z0-9]{6,15})\s*改派/);
     if (reassignM) {
       const oldId = reassignM[1];
-      for (const date of Object.keys(dailyOrders)) {
-        if (dailyOrders[date][oldId] !== undefined) {
-          dailyOrders[date][oldId] = null;
-          hasChanges[date] = true;
-          break;
-        }
+      const found = findOrderDate(oldId);
+      if (found) {
+        dailyOrders[found.date][found.key] = null;
+        hasChanges[found.date] = true;
       }
       const newOrders = parseOrders(text);
       for (const o of newOrders) {
@@ -604,7 +621,7 @@ app.post('/webhook', async (req, res) => {
         dailyOrders[date][key] = o;
         hasChanges[date] = true;
       }
-      const date = normalizeDate(newOrders[0]?.date);
+      const date = found ? found.date : normalizeDate(newOrders[0]?.date);
       scheduleFlush(sourceId, date);
       continue;
     }
