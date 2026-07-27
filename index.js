@@ -119,16 +119,33 @@ function splitBlocks(text) {
   const lines = text.split('\n');
   const blocks = [];
   let cur = [];
+  let justStartedWithVehicle = false; // 剛因車型標題而開新區塊
   for (const l of lines) {
     const t = l.trim().replace(/^["""「]/, '');
-    // 新訂單開頭：車型（九座送機）或 純訂單編號行（NFZ515768）
-    const isNewBlock =
-      t.match(/^([一二三四五六七八九十\d]+座|經五|商務|轎車|休旅|廂型)\s*(送機|接機)/) ||
-      (t.match(/^[A-Z0-9]{6,15}$/) && cur.length > 0 && !cur.join('').includes('結算價'));
-    if (isNewBlock && cur.length > 0) {
+    const isVehicleHeader = t.match(/^([一二三四五六七八九十\d]+座|經五|商務|轎車|休旅|廂型)\s*(送機|接機)/);
+    const isOrderIdLine = t.match(/^[A-Z0-9]{6,15}$/);
+
+    if (isVehicleHeader && cur.length > 0) {
       blocks.push(cur.join('\n'));
       cur = [l];
-    } else { cur.push(l); }
+      justStartedWithVehicle = true;
+      continue;
+    }
+    if (isOrderIdLine && cur.length > 0 && !cur.join('').includes('結算價')) {
+      // 若上一行剛好是車型標題（justStartedWithVehicle 且 cur 只有這一行），
+      // 代表這個編號行屬於同一筆訂單，不要切割
+      if (justStartedWithVehicle && cur.length === 1) {
+        cur.push(l);
+        justStartedWithVehicle = false;
+        continue;
+      }
+      blocks.push(cur.join('\n'));
+      cur = [l];
+      justStartedWithVehicle = false;
+      continue;
+    }
+    cur.push(l);
+    justStartedWithVehicle = false;
   }
   if (cur.length) blocks.push(cur.join('\n'));
   return blocks.filter(b => b.match(/結算價/));
