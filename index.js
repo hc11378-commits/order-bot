@@ -1,11 +1,66 @@
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 
-const CHANNEL_SECRET = 'ce5aafad66d4ea009b1f9ae3046035dd';
-const CHANNEL_ACCESS_TOKEN = 't7lUw3SX7cQVJpH5NthljqiLL5mBWCK9bFL1fam+ow99XRyrRK/2rw+5zxQtV3CmVn5jHGe8wsJFQ8cwHLOi2YAGENNR33yth7rIX6D6qSNDZbt2OcsO/opT1aIXhSS4f4qfx1k+uI5t8SjRxk9S2QdB04t89/1O/w1cDnyilFU=';
+// ── 機密資訊：一律從環境變數讀取，不寫死在程式碼裡 ──
+const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+const MONGO_URI = process.env.MONGO_URI; // 例如 mongodb+srv://user:pass@cluster.xxx.mongodb.net/
+
+if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
+  console.error('❌ 缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
+}
+if (!MONGO_URI) {
+  console.error('⚠️ 缺少 MONGO_URI 環境變數，月結統計功能將無法使用（當日簡表功能不受影響）');
+}
+
+// ── MongoDB 連線（月結統計用，永久保存每筆訂單紀錄）──
+let mongoClient = null;
+let ordersCollection = null;
+
+async function connectMongo() {
+  if (!MONGO_URI) return;
+  try {
+    mongoClient = new MongoClient(MONGO_URI);
+    await mongoClient.connect();
+    const db = mongoClient.db('orderbot');
+    ordersCollection = db.collection('orders');
+    console.log('✅ MongoDB 連線成功');
+  } catch (err) {
+    console.error('❌ MongoDB 連線失敗:', err.message);
+  }
+}
+connectMongo();
+
+// 寫入一筆訂單紀錄到 MongoDB（供月結統計使用）；失敗不影響當天簡表功能
+async function saveOrderToMongo(groupId, date, key, order) {
+  if (!ordersCollection) return;
+  try {
+    await ordersCollection.updateOne(
+      { groupId, date, key },
+      { $set: { groupId, date, key, ...order, cancelled: false, updatedAt: new Date() } },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error('MongoDB 寫入失敗:', err.message);
+  }
+}
+
+// 標記一筆訂單為已取消（月結統計時會排除）
+async function markOrderCancelledInMongo(groupId, date, key) {
+  if (!ordersCollection) return;
+  try {
+    await ordersCollection.updateOne(
+      { groupId, date, key },
+      { $set: { cancelled: true, updatedAt: new Date() } }
+    );
+  } catch (err) {
+    console.error('MongoDB 更新失敗:', err.message);
+  }
+}
 
 // ── 儲存：當天訂單（key=訂單編號, value=訂單資料）──
 // 格式: { [date]: { [orderId]: orderObj | null(取消) } }
@@ -597,6 +652,14 @@ app.post('/webhook', async (req, res) => {
     if (!sourceId) continue;
     groupIds[sourceId] = true;
 
+    // ── 0. 月結查詢：「月結」或「月結 8月」──
+    const monthCmd = parseMonthCommand(text);
+    if (monthCmd !== null) {
+      const report = await buildMonthlyReport(sourceId, monthCmd);
+      await pushMessage(sourceId, report);
+      continue;
+    }
+
     // ── 1. 取消：「XXX 訂單取消」或「XXX 取消」──
     const cancelM = text.match(/([A-Z0-9]{6,15})\s*(訂單取消|取消)/);
     if (cancelM) {
@@ -606,6 +669,7 @@ app.post('/webhook', async (req, res) => {
         dailyOrders[found.date][found.key] = null;
         hasChanges[found.date] = true;
         scheduleFlush(sourceId, found.date);
+        markOrderCancelledInMongo(sourceId, found.date, found.key);
       }
       continue;
     }
@@ -619,6 +683,7 @@ app.post('/webhook', async (req, res) => {
         dailyOrders[found.date][found.key] = null;
         hasChanges[found.date] = true;
         scheduleFlush(sourceId, found.date);
+        markOrderCancelledInMongo(sourceId, found.date, found.key);
       }
       continue;
     }
@@ -631,6 +696,7 @@ app.post('/webhook', async (req, res) => {
       if (found) {
         dailyOrders[found.date][found.key] = null;
         hasChanges[found.date] = true;
+        markOrderCancelledInMongo(sourceId, found.date, found.key);
       }
       const newOrders = parseOrders(text);
       for (const o of newOrders) {
@@ -639,6 +705,7 @@ app.post('/webhook', async (req, res) => {
         const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
         dailyOrders[date][key] = o;
         hasChanges[date] = true;
+        saveOrderToMongo(sourceId, date, key, o);
       }
       const date = found ? found.date : normalizeDate(newOrders[0]?.date);
       scheduleFlush(sourceId, date);
@@ -650,13 +717,12 @@ app.post('/webhook', async (req, res) => {
     if (pullbackM) {
       if (pullbackM[1]) {
         const orderId = pullbackM[1];
-        for (const date of Object.keys(dailyOrders)) {
-          if (dailyOrders[date][orderId] !== undefined) {
-            dailyOrders[date][orderId] = null;
-            hasChanges[date] = true;
-            scheduleFlush(sourceId, date);
-            break;
-          }
+        const found = findOrderDate(orderId);
+        if (found) {
+          dailyOrders[found.date][found.key] = null;
+          hasChanges[found.date] = true;
+          scheduleFlush(sourceId, found.date);
+          markOrderCancelledInMongo(sourceId, found.date, found.key);
         }
       }
       continue;
@@ -730,6 +796,7 @@ app.post('/webhook', async (req, res) => {
 
         const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
         dailyOrders[date][key] = o;
+        saveOrderToMongo(sourceId, date, key, o);
       }
       const date = normalizeDate(newOrders[0]?.date);
       if (newOrders.length) scheduleFlush(sourceId, date);
@@ -752,7 +819,107 @@ function normalizeDate(dateStr) {
   return getTodayStr();
 }
 
+// ════════════════════════════════════════
+// 月結統計
+// ════════════════════════════════════════
+
+// 中文數字/阿拉伯數字月份解析：「月結」「月結 8月」「月結8」
+function parseMonthCommand(text) {
+  const m = text.match(/^月結\s*(\d{1,2})\s*月?$/);
+  if (m) return parseInt(m[1]);
+  if (text.trim() === '月結') {
+    return new Date().getMonth() + 1; // 當月
+  }
+  return null;
+}
+
+// 從 MongoDB 撈出指定月份「未取消」的訂單，計算統計數據
+async function buildMonthlyReport(groupId, month) {
+  if (!ordersCollection) {
+    return '月結功能目前無法使用（資料庫未連線），請聯繫管理員確認設定。';
+  }
+
+  // date 欄位格式為 M/D（無年份），用正則篩選「月份/」開頭的資料
+  const datePattern = new RegExp(`^${month}/\\d{1,2}$`);
+
+  let records;
+  try {
+    records = await ordersCollection.find({
+      groupId,
+      cancelled: false,
+      date: { $regex: datePattern },
+    }).toArray();
+  } catch (err) {
+    console.error('月結查詢失敗:', err.message);
+    return '月結查詢時發生錯誤，請稍後再試。';
+  }
+
+  // 排除備注/交通車類的非訂單資料、以及沒有金額的待確認訂單
+  const validOrders = records.filter(r => typeof r.price === 'number');
+
+  if (!validOrders.length) {
+    return `${month}月尚無有效訂單紀錄，無法產生月結報表。`;
+  }
+
+  let total = 0;
+  let kesuTotal = 0;
+  const kesuCount = { count: 0 };
+  const remarkCount = { 舉牌: 0, 安椅: 0, 增高墊: 0 };
+
+  validOrders.forEach(o => {
+    total += o.price;
+    (o.remarks || []).forEach(r => {
+      if (r.startsWith('客收')) {
+        const amt = parseFloat(r.replace('客收', '')) || 0;
+        kesuTotal += amt;
+        kesuCount.count++;
+      } else if (remarkCount[r] !== undefined) {
+        remarkCount[r]++;
+      }
+    });
+  });
+
+  const tripCount = validOrders.length;
+  const avgPerTrip = tripCount ? (total / tripCount) : 0;
+
+  const lines = [];
+  lines.push(`${month}月結算報表`);
+  lines.push(`總趟數：${tripCount} 趟`);
+  lines.push(`總金額：${fmtP(total)}`);
+  lines.push(`平均每趟：${fmtP(Math.round(avgPerTrip * 10) / 10)}`);
+  if (kesuCount.count > 0) lines.push(`客收總額：${fmtP(kesuTotal)}（共${kesuCount.count}筆）`);
+  if (remarkCount.舉牌 > 0) lines.push(`舉牌次數：${remarkCount.舉牌}`);
+  if (remarkCount.安椅 > 0) lines.push(`安椅次數：${remarkCount.安椅}`);
+  if (remarkCount.增高墊 > 0) lines.push(`增高墊次數：${remarkCount.增高墊}`);
+
+  return lines.join('\n');
+}
+
 app.get('/', (req, res) => res.send('訂單簡表 Bot 運行中 ✅'));
+
+// 每天檢查是否為月底最後一天 23:50，自動發送當月月結
+let lastMonthlyReportSent = ''; // 記錄格式 'YYYY-MM'，避免同月重複發送
+setInterval(async () => {
+  const now = new Date();
+  const h = now.getHours();
+  const min = now.getMinutes();
+  if (h !== 23 || min !== 50) return;
+
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  const isLastDayOfMonth = tomorrow.getMonth() !== now.getMonth();
+  if (!isLastDayOfMonth) return;
+
+  const monthKey = `${now.getFullYear()}-${now.getMonth() + 1}`;
+  if (lastMonthlyReportSent === monthKey) return;
+  lastMonthlyReportSent = monthKey;
+
+  const month = now.getMonth() + 1;
+  for (const groupId of Object.keys(groupIds)) {
+    const report = await buildMonthlyReport(groupId, month);
+    await pushMessage(groupId, report);
+  }
+}, 60 * 1000);
 
 // ── 防止 Render 免費方案休眠：每 13 分鐘自我 ping 一次 ──
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://order-bot-45x0.onrender.com';
