@@ -1,12 +1,11 @@
-require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 
 const app = express();
 
-const CHANNEL_SECRET = process.env.CHANNEL_SECRET;
-const CHANNEL_ACCESS_TOKEN = process.env.CHANNEL_ACCESS_TOKEN;
+const CHANNEL_SECRET = 'ce5aafad66d4ea009b1f9ae3046035dd';
+const CHANNEL_ACCESS_TOKEN = 't7lUw3SX7cQVJpH5NthljqiLL5mBWCK9bFL1fam+ow99XRyrRK/2rw+5zxQtV3CmVn5jHGe8wsJFQ8cwHLOi2YAGENNR33yth7rIX6D6qSNDZbt2OcsO/opT1aIXhSS4f4qfx1k+uI5t8SjRxk9S2QdB04t89/1O/w1cDnyilFU=';
 
 // ── 儲存：當天訂單（key=訂單編號, value=訂單資料）──
 // 格式: { [date]: { [orderId]: orderObj | null(取消) } }
@@ -81,8 +80,9 @@ const DIST_MAP = {
 
 const REMARK_RULES = [
   { keys: ['舉牌','举牌','sign','placard'], label: '舉牌' },
-  { keys: ['兒童安全座椅','兒童座椅','安全座椅','嬰兒座椅','child seat','carseat'], label: '兒童座椅' },
-  { keys: ['增高墊','增高垫','booster'], label: '增高墊' },
+  // 增高墊需在安椅之前判斷，因「前向式安全座椅（增高）」要優先歸類為增高墊
+  { keys: ['增高墊','增高垫','兒童增高墊','前向式安全座椅（增高）','前向式安全座椅(增高)','booster'], label: '增高墊' },
+  { keys: ['兒童安全座椅','兒童座椅','安全座椅','嬰兒座椅','前向式安全座椅','向後式嬰兒安全座椅','向後式座椅','child seat','carseat'], label: '安椅' },
 ];
 
 function getCity(addr) {
@@ -118,37 +118,44 @@ function parseAddrNoDefault(addr) {
 
 function splitBlocks(text) {
   const lines = text.split('\n');
-  const blocks = [];
-  let cur = [];
-  let justStartedWithVehicle = false; // 剛因車型標題而開新區塊
-  for (const l of lines) {
-    const t = l.trim().replace(/^["""「]/, '');
-    const isVehicleHeader = t.match(/^([一二三四五六七八九十\d]+座|經五|商務|轎車|休旅|廂型)\s*(送機|接機)/);
+  const n = lines.length;
+
+  // 第一步：找出所有「新訂單起始點」的行號
+  // 起始點可能是：(a) 車型標題行 (b) 訂單編號行（但緊接在車型標題後的編號行不算獨立起點，屬於同一筆）
+  const startIndices = [];
+  let skipNext = false;
+  for (let i = 0; i < n; i++) {
+    if (skipNext) { skipNext = false; continue; }
+    const t = lines[i].trim().replace(/^["""「]/, '');
+    const isVehicleHeader = t.match(/^([一二三四五六七八九十\d]+座|經五|經七|休五|休旅|高五|高七|高九|假七|七座|阿法|Alphard|保母車|商務|轎車|廂型)\s*(送機|接機)/i);
     const isOrderIdLine = t.match(/^[A-Z0-9]{6,15}$/);
 
-    if (isVehicleHeader && cur.length > 0) {
-      blocks.push(cur.join('\n'));
-      cur = [l];
-      justStartedWithVehicle = true;
-      continue;
-    }
-    if (isOrderIdLine && cur.length > 0 && !cur.join('').includes('結算價')) {
-      // 若上一行剛好是車型標題（justStartedWithVehicle 且 cur 只有這一行），
-      // 代表這個編號行屬於同一筆訂單，不要切割
-      if (justStartedWithVehicle && cur.length === 1) {
-        cur.push(l);
-        justStartedWithVehicle = false;
-        continue;
+    if (isVehicleHeader) {
+      startIndices.push(i);
+      // 檢查下一行是否為訂單編號行，若是，視為同一筆訂單的一部分，跳過不再判斷
+      const nextT = (i + 1 < n) ? lines[i + 1].trim().replace(/^["""「]/, '') : '';
+      if (nextT.match(/^[A-Z0-9]{6,15}$/)) {
+        skipNext = true;
       }
-      blocks.push(cur.join('\n'));
-      cur = [l];
-      justStartedWithVehicle = false;
       continue;
     }
-    cur.push(l);
-    justStartedWithVehicle = false;
+    if (isOrderIdLine) {
+      startIndices.push(i);
+    }
   }
-  if (cur.length) blocks.push(cur.join('\n'));
+
+  // 第二步：依起始點切割成區塊
+  const blocks = [];
+  for (let k = 0; k < startIndices.length; k++) {
+    const start = startIndices[k];
+    const end = (k + 1 < startIndices.length) ? startIndices[k + 1] : n;
+    blocks.push(lines.slice(start, end).join('\n'));
+  }
+  // 若完全沒有起始點被偵測到（例如整段只有一筆且無明顯標頭），把全文當一筆
+  if (!blocks.length && text.trim()) {
+    blocks.push(text);
+  }
+
   return blocks.filter(b => b.match(/結算價/));
 }
 
@@ -222,8 +229,19 @@ function detectRemarks(block) {
   if (rLine) {
     const note = rLine[1].trim().toLowerCase();
     if (note && note !== '-' && note !== '無') {
+      // 先扣掉「前向式安全座椅（增高）/(增高)」這個重疊片語，避免它被安椅規則的
+      // 「前向式安全座椅」子字串誤判為安椅；扣除後再逐一比對兩個規則
+      const noteForSeatCheck = note
+        .replace(/前向式安全座椅（增高）/g, '')
+        .replace(/前向式安全座椅\(增高\)/g, '');
+
+      const matchedLabels = new Set();
       for (const rule of REMARK_RULES) {
-        if (rule.keys.some(k => note.includes(k.toLowerCase()))) found.push(rule.label);
+        const target = (rule.label === '安椅') ? noteForSeatCheck : note;
+        if (rule.keys.some(k => target.includes(k.toLowerCase()))) {
+          matchedLabels.add(rule.label);
+          found.push(rule.label);
+        }
       }
     }
   }
@@ -430,7 +448,7 @@ function buildSummary(date, orders) {
     if (o.isPlaceholder || o.isShuttle) return;
     o.remarks.forEach(r => {
       if (r.startsWith('客收')) kesuList.push(r);
-      else if (['舉牌','兒童座椅','增高墊'].includes(r)) otherCount[r] = (otherCount[r]||0) + 1;
+      else if (['舉牌','安椅','增高墊'].includes(r)) otherCount[r] = (otherCount[r]||0) + 1;
     });
   });
 
@@ -544,7 +562,6 @@ function verifySignature(req) {
 }
 
 // 每分鐘檢查是否到23:50
-let lastScheduledDate = null;
 setInterval(async () => {
   const now = new Date();
   const h = now.getHours();
