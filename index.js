@@ -6,12 +6,12 @@ const { MongoClient } = require('mongodb');
 const app = express();
 
 // ── 機密資訊：一律從環境變數讀取，不寫死在程式碼裡 ──
-const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const MONGO_URI = process.env.MONGO_URI; // 例如 mongodb+srv://user:pass@cluster.xxx.mongodb.net/
+const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET?.trim();
+const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();
+const MONGO_URI = process.env.MONGO_URI?.trim(); // 例如 mongodb+srv://user:pass@cluster.xxx.mongodb.net/
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
-  console.error('❌ 缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
+  throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
 }
 if (!MONGO_URI) {
   console.error('⚠️ 缺少 MONGO_URI 環境變數，月結統計功能將無法使用（當日簡表功能不受影響）');
@@ -611,12 +611,20 @@ app.use(express.json({
 
 function verifySignature(req) {
   const sig = req.headers['x-line-signature'];
-  if (!sig) return false;
-  const hash = crypto.createHmac('sha256', CHANNEL_SECRET).update(req.rawBody).digest('base64');
-  return hash === sig;
+  if (!sig || !req.rawBody) return false;
+
+  const expected = crypto
+    .createHmac('sha256', CHANNEL_SECRET)
+    .update(req.rawBody)
+    .digest();
+  const received = Buffer.from(sig, 'base64');
+
+  return received.length === expected.length &&
+    crypto.timingSafeEqual(received, expected);
 }
 
-// 每分鐘檢查是否到23:50
+// 每分鐘檢查是否到23:50；記錄當天是否已執行，避免同一分鐘重複推送
+let lastScheduledDate = '';
 setInterval(async () => {
   const now = new Date();
   const h = now.getHours();
