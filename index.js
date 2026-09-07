@@ -9,6 +9,7 @@ const app = express();
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET?.trim();
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();
 const MONGO_URI = process.env.MONGO_URI?.trim(); // 例如 mongodb+srv://user:pass@cluster.xxx.mongodb.net/
+const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -602,6 +603,20 @@ function scheduleFlush(groupId, date) {
   }, 5 * 60 * 1000); // 5分鐘
 }
 
+// 測試模式使用 replyToken 即時回覆，不消耗 LINE 每月 Push 訊息額度。
+// 正式模式則維持原本的 5 分鐘彙整後 Push。
+async function sendOrScheduleSummary(replyToken, groupId, date) {
+  if (!TEST_MODE) {
+    scheduleFlush(groupId, date);
+    return;
+  }
+
+  const orders = dailyOrders[date];
+  if (!orders) return;
+  const summary = buildSummary(date, orders);
+  if (summary) await replyMessage(replyToken, summary);
+}
+
 // ════════════════════════════════════════
 // Webhook
 // ════════════════════════════════════════
@@ -660,11 +675,17 @@ app.post('/webhook', async (req, res) => {
     if (!sourceId) continue;
     groupIds[sourceId] = true;
 
+    // ── 測試指令：使用 Reply API，不計入每月 Push 訊息額度 ──
+    if (text === '測試') {
+      await replyMessage(event.replyToken, 'BOT 測試成功 ✅');
+      continue;
+    }
+
     // ── 0. 月結查詢：「月結」或「月結 8月」──
     const monthCmd = parseMonthCommand(text);
     if (monthCmd !== null) {
       const report = await buildMonthlyReport(sourceId, monthCmd);
-      await pushMessage(sourceId, report);
+      await replyMessage(event.replyToken, report);
       continue;
     }
 
@@ -676,7 +697,7 @@ app.post('/webhook', async (req, res) => {
       if (found) {
         dailyOrders[found.date][found.key] = null;
         hasChanges[found.date] = true;
-        scheduleFlush(sourceId, found.date);
+        await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
         markOrderCancelledInMongo(sourceId, found.date, found.key);
       }
       continue;
@@ -690,7 +711,7 @@ app.post('/webhook', async (req, res) => {
       if (found) {
         dailyOrders[found.date][found.key] = null;
         hasChanges[found.date] = true;
-        scheduleFlush(sourceId, found.date);
+        await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
         markOrderCancelledInMongo(sourceId, found.date, found.key);
       }
       continue;
@@ -716,7 +737,7 @@ app.post('/webhook', async (req, res) => {
         saveOrderToMongo(sourceId, date, key, o);
       }
       const date = found ? found.date : normalizeDate(newOrders[0]?.date);
-      scheduleFlush(sourceId, date);
+      await sendOrScheduleSummary(event.replyToken, sourceId, date);
       continue;
     }
 
@@ -729,7 +750,7 @@ app.post('/webhook', async (req, res) => {
         if (found) {
           dailyOrders[found.date][found.key] = null;
           hasChanges[found.date] = true;
-          scheduleFlush(sourceId, found.date);
+          await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
           markOrderCancelledInMongo(sourceId, found.date, found.key);
         }
       }
@@ -756,7 +777,7 @@ app.post('/webhook', async (req, res) => {
         display: `補${hour}${type}`,
       };
       hasChanges[date] = true;
-      scheduleFlush(sourceId, date);
+      await sendOrScheduleSummary(event.replyToken, sourceId, date);
       continue;
     }
 
@@ -776,7 +797,7 @@ app.post('/webhook', async (req, res) => {
         display: paxNote ? `${label}，${paxNote}` : label,
       };
       hasChanges[date] = true;
-      scheduleFlush(sourceId, date);
+      await sendOrScheduleSummary(event.replyToken, sourceId, date);
       continue;
     }
 
@@ -807,7 +828,7 @@ app.post('/webhook', async (req, res) => {
         saveOrderToMongo(sourceId, date, key, o);
       }
       const date = normalizeDate(newOrders[0]?.date);
-      if (newOrders.length) scheduleFlush(sourceId, date);
+      if (newOrders.length) await sendOrScheduleSummary(event.replyToken, sourceId, date);
     }
   }
 });
