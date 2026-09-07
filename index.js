@@ -894,9 +894,13 @@ async function buildMonthlyReport(groupId, month) {
   let kesuTotal = 0;
   const kesuCount = { count: 0 };
   const remarkCount = { 舉牌: 0, 安椅: 0, 增高墊: 0 };
+  const dailyStats = {};
 
   validOrders.forEach(o => {
     total += o.price;
+    if (!dailyStats[o.date]) dailyStats[o.date] = { count: 0, total: 0 };
+    dailyStats[o.date].count++;
+    dailyStats[o.date].total += o.price;
     (o.remarks || []).forEach(r => {
       if (r.startsWith('客收')) {
         const amt = parseFloat(r.replace('客收', '')) || 0;
@@ -910,9 +914,18 @@ async function buildMonthlyReport(groupId, month) {
 
   const tripCount = validOrders.length;
   const avgPerTrip = tripCount ? (total / tripCount) : 0;
+  const sortedDates = Object.keys(dailyStats).sort((a, b) => {
+    const [aMonth, aDay] = a.split('/').map(Number);
+    const [bMonth, bDay] = b.split('/').map(Number);
+    return (aMonth * 100 + aDay) - (bMonth * 100 + bDay);
+  });
+  const firstDate = sortedDates[0];
+  const lastDate = sortedDates[sortedDates.length - 1];
 
   const lines = [];
   lines.push(`${month}月結算報表`);
+  lines.push(`資料涵蓋：${firstDate}${firstDate === lastDate ? '' : `～${lastDate}`}`);
+  lines.push('統計口徑：未取消且金額已確認');
   lines.push(`總趟數：${tripCount} 趟`);
   lines.push(`總金額：${fmtP(total)}`);
   lines.push(`平均每趟：${fmtP(Math.round(avgPerTrip * 10) / 10)}`);
@@ -920,6 +933,11 @@ async function buildMonthlyReport(groupId, month) {
   if (remarkCount.舉牌 > 0) lines.push(`舉牌次數：${remarkCount.舉牌}`);
   if (remarkCount.安椅 > 0) lines.push(`安椅次數：${remarkCount.安椅}`);
   if (remarkCount.增高墊 > 0) lines.push(`增高墊次數：${remarkCount.增高墊}`);
+  lines.push('每日明細：');
+  sortedDates.forEach(date => {
+    const stats = dailyStats[date];
+    lines.push(`${date}：${stats.count} 趟，${fmtP(stats.total)}`);
+  });
 
   return lines.join('\n');
 }
