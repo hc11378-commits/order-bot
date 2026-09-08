@@ -96,6 +96,68 @@ test('一般送機訂單解析正確', () => {
   assert.equal(order.price, 665);
 });
 
+test('實際缺單 CUG338169 含彎引號與附加司機資料仍可完整辨識', () => {
+  const text = [
+    '“休旅接機-J',
+    'CUG338169',
+    '出發日期:9/10',
+    '乘車人數:2',
+    '行李數量:',
+    '航班編號:CI52【05:40】',
+    '上車地點:桃園機場',
+    '下車地點:台灣台北市中山區新福里(民權東路二段63號)',
+    '其他備註:',
+    '聯絡人:TEST CUSTOMER',
+    '電話:0900000000',
+    '結算價704.00"',
+    '',
+    '姓名:測試司機',
+    '電話:0900000000',
+    '車號:TEST-0001',
+    '車型:Toyota Rav4(白色',
+  ].join('\n');
+  const orders = bot.parseOrders(text);
+  assert.equal(orders.length, 1);
+  assert.deepEqual({
+    orderId: orders[0].orderId, date: bot.normalizeDate(orders[0].date),
+    time: orders[0].time, type: orders[0].type, loc: orders[0].loc,
+    pax: orders[0].pax, price: orders[0].price,
+  }, {
+    orderId: 'CUG338169', date: '9/10', time: '05:40', type: '接',
+    loc: '台北市中山區', pax: 2, price: 704,
+  });
+});
+
+test('實際發哥單只有客收1100、無結算價與無英數編號仍計為一趟', () => {
+  const text = [
+    '"經五接機', '發哥單', '出發日期：9/10', '乘車人數：1-2', '行李數量：',
+    '航班編號：JX803 【19:00】', '上車地點：桃園機場',
+    '下車地點：板橋區合安一路77號9樓之2', '其他備註：', '',
+    '聯絡人：測試小姐', '電話：0900000000', '★客收1100"', '',
+    '司機姓名：測試司機', '電話：0900000000', '車型：KIA Carnival (白色)', '車號：TEST-0002.',
+  ].join('\n');
+  const orders = bot.parseOrders(text);
+  assert.equal(orders.length, 1);
+  assert.deepEqual({
+    orderId: orders[0].orderId, date: bot.normalizeDate(orders[0].date),
+    time: orders[0].time, type: orders[0].type, loc: orders[0].loc,
+    pax: orders[0].pax, price: orders[0].price, remarks: orders[0].remarks,
+  }, {
+    orderId: null, date: '9/10', time: '19:00', type: '接',
+    loc: '新北市板橋區', pax: '1-2', price: null, remarks: ['客收1100'],
+  });
+});
+
+test('一般營運備註可保留，且不會把後續姓名電話當成備註', () => {
+  const [order] = bot.parseOrders([
+    '休旅接機', 'NOTE0001', '出發日期:9/10', '乘車人數:1',
+    '航班編號:CI52【05:40】', '上車地點:桃園機場', '下車地點:台北市中山區',
+    '其他備註:需輪椅協助', '聯絡人:王先生', '電話:0900000000', '結算價704',
+  ].join('\n'));
+  assert.deepEqual(order.remarks, ['需輪椅協助']);
+  assert.doesNotMatch(order.remarks.join(','), /0900000000|王先生/);
+});
+
 test('同一則訊息的兩筆訂單都能拆分且不重複', () => {
   const text = [
     '五座接機', 'AAA11111', '出發日期：2026/9/8 01:00',
@@ -144,6 +206,7 @@ test('日期一律正規化為 M/D', () => {
   assert.equal(bot.normalizeDate('2026/02/29'), null);
   assert.equal(bot.normalizeDate('13/40'), null);
   assert.equal(bot.normalizeDate('日期不明'), null);
+  assert.equal(bot.normalizeDate(null), null);
 });
 
 test('完整日期可取出服務年份', () => {
@@ -179,6 +242,27 @@ test('不同 LINE 群組的同日訂單完全隔離', () => {
   assert.doesNotMatch(summaryB, /700/);
 });
 
+test('沒有訂單編號的相同趟次使用 LINE 訊息 ID 區分，webhook 重送仍保持同一筆', () => {
+  const order = { orderId: null, time: '08:00', price: 700, loc: '台北市中山區' };
+  assert.notEqual(
+    bot.getOrderStorageKey(order, 'message-1', 0),
+    bot.getOrderStorageKey(order, 'message-2', 0)
+  );
+  assert.equal(
+    bot.getOrderStorageKey(order, 'message-1', 0),
+    bot.getOrderStorageKey(order, 'message-1', 0)
+  );
+});
+
+test('舊資料若有相同群組日期及 key 的重複紀錄，只保留最新一筆', () => {
+  const records = bot.dedupeOrderRecords([
+    { groupId: 'g', serviceYear: 2026, date: '9/10', key: 'DUP0001', price: 700, updatedAt: new Date('2026-09-08T01:00:00Z') },
+    { groupId: 'g', serviceYear: 2026, date: '9/10', key: 'DUP0001', price: 750, updatedAt: new Date('2026-09-08T02:00:00Z') },
+  ]);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].price, 750);
+});
+
 test('同群組事件依序處理、不同群組可同時處理', async () => {
   const releaseFirst = await bot.acquireSourceQueue('queue-A');
   let secondAcquired = false;
@@ -208,7 +292,9 @@ test('模擬 35 個司機群組的資料不會互相混入摘要', () => {
   for (let index = 1; index <= 35; index++) {
     const groupId = `driver-group-${index}`;
     const summary = bot.buildSummary(groupId, '9/20', bot.getDateOrders(groupId, '9/20'));
-    assert.match(summary, new RegExp(`結：${1000 + index}$`));
+    assert.match(summary, new RegExp(`結算價合計：${1000 + index}`));
+    assert.match(summary, new RegExp(`客收合計：0`));
+    assert.match(summary, new RegExp(`業績合計：${1000 + index}$`));
   }
 });
 
@@ -219,7 +305,10 @@ test('摘要依時間排序並正確計算小數金額及備註', () => {
   };
   const summary = bot.buildSummary('summary-group', '9/7', orders);
   assert.ok(summary.indexOf('00:10') < summary.indexOf('15:20'));
-  assert.match(summary, /結：1616\.5，客收200、安椅\*1/);
+  assert.match(summary, /結算價合計：1616\.5/);
+  assert.match(summary, /客收合計：200/);
+  assert.match(summary, /業績合計：1816\.5/);
+  assert.match(summary, /其他備註統計：安椅\*1/);
 });
 
 test('LINE webhook 簽章使用原始內容驗證', () => {
@@ -254,6 +343,49 @@ test('MongoDB 寫入使用正規化日期且不會被原始日期覆蓋', async 
   assert.equal(captured.options.upsert, true);
 });
 
+test('同訂單編號改日期時先寫入新單，再排除舊日期避免月結重複', async () => {
+  const calls = [];
+  bot.__setOrdersCollectionForTests({
+    async updateOne(filter) { calls.push({ method: 'updateOne', filter }); },
+    async updateMany(filter) { calls.push({ method: 'updateMany', filter }); },
+  });
+  const saved = await bot.saveOrderToMongo('date-change-group', '9/11', 'MOVE0001', {
+    orderId: 'MOVE0001', date: '2026/9/11', time: '08:00', price: 700,
+  });
+  assert.equal(saved, true);
+  assert.equal(calls[0].method, 'updateOne');
+  assert.deepEqual(calls[0].filter, {
+    groupId: 'date-change-group', serviceYear: 2026, date: '9/11', key: 'MOVE0001',
+  });
+  assert.equal(calls[1].method, 'updateMany');
+  assert.equal(calls[1].filter.groupId, 'date-change-group');
+  assert.equal(calls[1].filter.key, 'MOVE0001');
+  assert.equal(calls[1].filter.cancelled, false);
+});
+
+test('同訂單編號重貼改單與新備註時只更新原紀錄，不增加趟數', async () => {
+  const records = [];
+  bot.__setOrdersCollectionForTests({
+    async updateOne(filter, update) {
+      const index = records.findIndex(record => record.groupId === filter.groupId &&
+        record.serviceYear === filter.serviceYear && record.date === filter.date && record.key === filter.key);
+      if (index >= 0) records[index] = { ...records[index], ...update.$set };
+      else records.push({ ...update.$set });
+    },
+    async updateMany() {},
+  });
+  await bot.saveOrderToMongo('update-group', '9/10', 'UPD00001', {
+    orderId: 'UPD00001', date: '2026/9/10', time: '08:00', price: 700, remarks: [],
+  });
+  await bot.saveOrderToMongo('update-group', '9/10', 'UPD00001', {
+    orderId: 'UPD00001', date: '2026/9/10', time: '08:30', price: 750, remarks: ['需輪椅協助'],
+  });
+  assert.equal(records.length, 1);
+  assert.equal(records[0].time, '08:30');
+  assert.equal(records[0].price, 750);
+  assert.deepEqual(records[0].remarks, ['需輪椅協助']);
+});
+
 test('部署重啟後仍可從 MongoDB 找回同群組訂單', async () => {
   bot.__setOrdersCollectionForTests({
     async findOne(query) {
@@ -270,7 +402,7 @@ test('部署重啟後仍可從 MongoDB 找回同群組訂單', async () => {
   assert.ok(bot.getDateOrders('restart-group', '9/7').RESTART01);
 });
 
-test('月結只統計指定群組、年份、月份、未取消且有數字金額的訂單', async () => {
+test('月結只查指定群組年月，並分開結算價、客收與業績', async () => {
   let capturedQuery;
   const records = [
     { date: '9/6', price: 6114, remarks: [] },
@@ -288,10 +420,27 @@ test('月結只統計指定群組、年份、月份、未取消且有數字金�
   assert.equal(capturedQuery.serviceYear, 2026);
   assert.equal(capturedQuery.cancelled, false);
   assert.match(report, /2026年9月結算報表/);
-  assert.match(report, /總趟數：2 趟/);
-  assert.match(report, /總金額：11832/);
-  assert.match(report, /平均每趟：5916/);
+  assert.match(report, /總趟數：3 趟/);
+  assert.match(report, /結算價總額：11832\+待確認/);
   assert.match(report, /客收總額：200（共1筆）/);
+  assert.match(report, /業績總額：12032\+待確認/);
+  assert.match(report, /平均每趟業績：4010\.7\+待確認/);
+});
+
+test('月結將待確認結算價訂單計入趟數，並把已知客收納入業績', async () => {
+  bot.__setOrdersCollectionForTests({
+    find() {
+      return { async toArray() { return [
+        { key: 'KNOWN001', serviceYear: 2026, date: '9/10', price: 500, remarks: [] },
+        { key: 'PENDING1', serviceYear: 2026, date: '9/10', price: null, remarks: ['客收1100'] },
+      ]; } };
+    },
+  });
+  const report = await bot.buildMonthlyReport('pending-month-group', 9, 2026);
+  assert.match(report, /總趟數：2 趟/);
+  assert.match(report, /結算價總額：500\+待確認/);
+  assert.match(report, /客收總額：1100（共1筆）/);
+  assert.match(report, /業績總額：1600\+待確認/);
 });
 
 test('三個實際群組會產生不同匿名代碼且診斷只查自己的 groupId', async () => {
@@ -320,7 +469,8 @@ test('三個實際群組會產生不同匿名代碼且診斷只查自己的 grou
   assert.equal(new Set(codes).size, 3);
   assert.match(reports[0], /執行時間：9\/10 12:00/);
   assert.match(reports[0], /檢查服務日：9\/10/);
-  assert.match(reports[0], /MongoDB金額：701/);
+  assert.match(reports[0], /結算價總額：701/);
+  assert.match(reports[0], /業績總額：701/);
   assert.doesNotMatch(reports[0], /703/);
 });
 
@@ -350,6 +500,29 @@ test('執行日9/8可明確診斷9/10預派單，且查詢不會離開當前群�
   assert.match(report, /檢查服務日：9\/10/);
   assert.match(report, /服務日訂單：/);
   assert.match(report, /新北市板橋區送/);
+});
+
+test('群組診斷將結算價與客收分開，業績為兩者相加', async () => {
+  bot.__setOrdersCollectionForTests({
+    find() {
+      return {
+        sort() { return this; },
+        async toArray() { return [
+          { key: 'PERF0001', groupId: 'performance-group', serviceYear: 2026, date: '9/10', time: '08:00', type: '接', loc: '台北市中山區', price: 700, remarks: ['客收200'] },
+          { key: 'PERF0002', groupId: 'performance-group', serviceYear: 2026, date: '9/10', time: '09:00', type: '送', loc: '新北市板橋區', price: null, remarks: ['客收1100'] },
+        ]; },
+      };
+    },
+  });
+  const report = await bot.buildGroupDiagnostic(
+    'performance-group', { senderId: 'user', conversationType: 'group' },
+    new Date('2026-09-08T10:00:00.000Z'), '9/10'
+  );
+  assert.match(report, /MongoDB有效訂單：2 筆/);
+  assert.match(report, /結算價總額：700/);
+  assert.match(report, /客收總額：1300/);
+  assert.match(report, /業績總額：2000\+待確認/);
+  assert.match(report, /待確認金額：1 筆/);
 });
 
 test('群組診斷未指定日期時，只從該群組自動找最近服務日', async () => {
@@ -496,7 +669,8 @@ test('9/7 修正完整吻合時只標記額外資料取消', async () => {
   assert.match(result, /9\/7 修正完成/);
   assert.match(result, /排除多餘紀錄：1 筆/);
   assert.match(result, /總趟數：8 趟/);
-  assert.match(result, /總金額：5718/);
+  assert.match(result, /結算價總額：5718/);
+  assert.match(result, /業績總額：5718/);
   const extraOperation = operations.find(operation => operation.updateOne.filter._id === 'extra-1');
   assert.equal(extraOperation.updateOne.update.$set.cancelled, true);
   assert.equal(operations.filter(operation => operation.updateOne.update.$set.cancelled === true).length, 1);
@@ -534,6 +708,12 @@ test('完整 webhook 流程可接單、寫入 MongoDB 並用 Reply API 回覆', 
   let mongoWrite;
   bot.__setOrdersCollectionForTests({
     async updateOne(filter, update, options) { mongoWrite = { filter, update, options }; },
+    find() {
+      return {
+        sort() { return this; },
+        async toArray() { return mongoWrite ? [mongoWrite.update.$set] : []; },
+      };
+    },
   });
   const originalPost = axios.post;
   let lineReply;
@@ -569,6 +749,275 @@ test('完整 webhook 流程可接單、寫入 MongoDB 並用 Reply API 回覆', 
     assert.equal(mongoWrite.update.$set.senderKey.length, 10);
     assert.match(lineReply.url, /message\/reply$/);
     assert.match(lineReply.payload.messages[0].text, /接新北市土城區/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('重啟後只補貼 CUG338169 一次，Bot 即從 MongoDB 同步完整九筆與總額6253', async () => {
+  const groupId = 'missing-order-group';
+  const records = [
+    ['A0000001','00:10','接','新北市永和區',803],
+    ['A0000002','02:00','接','台北市萬華區',813],
+    ['A0000003','05:00','送','台北市中正區',850],
+    ['A0000004','09:00','送','台北市松山區',650],
+    ['A0000005','10:25','接','台北市信義區',684],
+    ['A0000006','12:30','送','台北市大安區',530],
+    ['A0000007','13:20','接','台北市中正區',684],
+    ['A0000008','16:00','送','台北市內湖區',535],
+  ].map(([key,time,type,loc,price], index) => ({
+    groupId, serviceYear: 2026, date: '9/10', key, orderId: key,
+    time, type, loc, price, pax: 1, remarks: [], cancelled: false,
+    updatedAt: new Date(`2026-09-08T0${index}:00:00.000Z`),
+  }));
+
+  bot.__setOrdersCollectionForTests({
+    async updateOne(filter, update) {
+      const index = records.findIndex(record => record.groupId === filter.groupId &&
+        record.serviceYear === filter.serviceYear && record.date === filter.date && record.key === filter.key);
+      if (index >= 0) records[index] = { ...records[index], ...update.$set };
+      else records.push({ ...update.$set });
+    },
+    async updateMany() {},
+    find(query) {
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        record.serviceYear === query.serviceYear && record.date === query.date &&
+        record.cancelled === query.cancelled);
+      return {
+        sort() { return this; },
+        async toArray() { return matched; },
+      };
+    },
+  });
+
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const orderText = [
+    '“休旅接機-J', 'CUG338169', '出發日期:9/10', '乘車人數:2', '行李數量:',
+    '航班編號:CI52【05:40】', '上車地點:桃園機場',
+    '下車地點:台灣台北市中山區新福里(民權東路二段63號)',
+    '其他備註:', '聯絡人:測試', '電話:0900000000', '結算價704.00"',
+    '', '姓名:測試司機', '電話:0900000000', '車號:TEST-0001', '車型:Toyota Rav4(白色',
+  ].join('\n');
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'missing-order-reply',
+    source: { type: 'group', groupId, userId: 'dispatcher-user' },
+    message: { type: 'text', id: 'missing-order-message', text: orderText },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-line-signature': signature },
+      body,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(records.filter(record => !record.cancelled).length, 9);
+    assert.match(replyText, /1。00:10/);
+    assert.match(replyText, /3。05:00/);
+    assert.match(replyText, /4。05:40，接台北市中山區/);
+    assert.match(replyText, /9。16:00/);
+    assert.match(replyText, /結算價合計：6253/);
+    assert.match(replyText, /客收合計：0/);
+    assert.match(replyText, /業績合計：6253$/m);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('重啟後只補貼發哥單一次，Bot 即回覆完整八趟、已確認5206及客收1100', async () => {
+  const groupId = 'customer-collection-group';
+  const records = [
+    ['B0000001','08:30','送','台北市士林區',670],
+    ['B0000002','09:00','接','台北市萬華區',995],
+    ['B0000003','12:00','送','台北市萬華區',633],
+    ['B0000004','12:35','接','台北市士林區',885],
+    ['B0000005','15:10','送','台北市士林區',535],
+    ['B0000006','15:45','接','新北市蘆洲區',895],
+    ['B0000007','18:30','送','台北市中正區',593],
+  ].map(([key,time,type,loc,price], index) => ({
+    groupId, serviceYear: 2026, date: '9/10', key, orderId: key,
+    time, type, loc, price, pax: 1, remarks: [], cancelled: false,
+    updatedAt: new Date(`2026-09-08T0${index}:00:00.000Z`),
+  }));
+  bot.__setOrdersCollectionForTests({
+    async updateOne(filter, update) {
+      const index = records.findIndex(record => record.groupId === filter.groupId &&
+        record.serviceYear === filter.serviceYear && record.date === filter.date && record.key === filter.key);
+      if (index >= 0) records[index] = { ...records[index], ...update.$set };
+      else records.push({ ...update.$set });
+    },
+    async updateMany() {},
+    find(query) {
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        record.serviceYear === query.serviceYear && record.date === query.date &&
+        record.cancelled === query.cancelled);
+      return { sort() { return this; }, async toArray() { return matched; } };
+    },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const orderText = [
+    '"經五接機', '發哥單', '出發日期：9/10', '乘車人數：1-2', '行李數量：',
+    '航班編號：JX803 【19:00】', '上車地點：桃園機場',
+    '下車地點：板橋區合安一路77號9樓之2', '其他備註：', '',
+    '聯絡人：測試', '電話：0900000000', '★客收1100"', '',
+    '司機姓名：測試司機', '電話：0900000000', '車型：KIA Carnival (白色)', '車號：TEST-0002.',
+  ].join('\n');
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'collection-reply',
+    source: { type: 'group', groupId, userId: 'dispatcher-user' },
+    message: { type: 'text', id: 'customer-collection-message', text: orderText },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(records.filter(record => !record.cancelled).length, 8);
+    assert.match(replyText, /8。19:00，接新北市板橋區/);
+    assert.match(replyText, /待確認金額/);
+    assert.match(replyText, /結算價合計：5206\+待確認/);
+    assert.match(replyText, /客收合計：1100/);
+    assert.match(replyText, /業績合計：6306\+待確認$/m);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('MongoDB 寫入失敗時不回覆虛假成功簡表', async () => {
+  bot.__setOrdersCollectionForTests({
+    async updateOne() { throw new Error('simulated database failure'); },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const orderText = [
+    '五座接機', 'FAIL0001', '出發日期：2026/09/10 06:30',
+    '上車地點：桃園機場', '下車地點：新北市土城區', '乘車人數：2', '結算價：866',
+  ].join('\n');
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'failure-reply', source: { type: 'group', groupId: 'failure-group', userId: 'user' },
+    message: { type: 'text', id: 'failure-message', text: orderText },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+    assert.equal(response.status, 200);
+    assert.match(replyText, /訂單儲存失敗/);
+    assert.doesNotMatch(replyText, /業績合計：866/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('缺少服務日的預派單不會被誤存成執行當天', async () => {
+  let databaseWriteCalled = false;
+  bot.__setOrdersCollectionForTests({
+    async updateOne() { databaseWriteCalled = true; },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const orderText = [
+    '五座接機', 'NODATE01', '乘車人數：2', '航班編號：CI52【05:40】',
+    '上車地點：桃園機場', '下車地點：新北市板橋區', '結算價：704',
+  ].join('\n');
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'no-date-reply', source: { type: 'group', groupId: 'no-date-group', userId: 'user' },
+    message: { type: 'text', id: 'no-date-message', text: orderText },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(databaseWriteCalled, false);
+    assert.match(replyText, /訂單格式無法完整辨識/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('最後一筆訂單取消後仍明確回覆零筆，不會無反應', async () => {
+  const record = {
+    groupId: 'cancel-last-group', serviceYear: 2026, date: '9/10', key: 'CANCEL01', orderId: 'CANCEL01',
+    time: '08:00', type: '接', loc: '台北市中山區', price: 700, pax: 1, remarks: [], cancelled: false,
+  };
+  bot.__setOrdersCollectionForTests({
+    async findOne() { return record.cancelled ? null : record; },
+    async updateOne(filter, update) {
+      if (filter.groupId === record.groupId && filter.key === record.key) Object.assign(record, update.$set);
+    },
+    find(query) {
+      const matched = !record.cancelled && query.groupId === record.groupId ? [record] : [];
+      return { sort() { return this; }, async toArray() { return matched; } };
+    },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'cancel-last-reply', source: { type: 'group', groupId: record.groupId, userId: 'user' },
+    message: { type: 'text', id: 'cancel-last-message', text: 'CANCEL01 取消' },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(record.cancelled, true);
+    assert.match(replyText, /目前無有效訂單/);
+    assert.match(replyText, /結算價合計：0/);
+    assert.match(replyText, /客收合計：0/);
+    assert.match(replyText, /業績合計：0/);
   } finally {
     axios.post = originalPost;
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
