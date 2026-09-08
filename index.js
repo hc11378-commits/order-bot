@@ -10,6 +10,8 @@ const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET?.trim();
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();
 const MONGO_URI = process.env.MONGO_URI?.trim(); // 例如 mongodb+srv://user:pass@cluster.xxx.mongodb.net/
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
+const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
+const BUSINESS_TIME_ZONE = 'Asia/Taipei';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -28,21 +30,40 @@ async function connectMongo() {
     mongoClient = new MongoClient(MONGO_URI);
     await mongoClient.connect();
     const db = mongoClient.db('orderbot');
-    ordersCollection = db.collection('orders');
+    const collection = db.collection('orders');
+    await collection.createIndex({ groupId: 1, serviceYear: 1, date: 1, cancelled: 1 });
+    await collection.createIndex({ groupId: 1, key: 1, cancelled: 1 });
+    // 舊資料沒有年份；以實際寫入時間補上，避免日後跨年度月結混在一起。
+    await collection.updateMany(
+      { serviceYear: { $exists: false }, updatedAt: { $type: 'date' } },
+      [{ $set: { serviceYear: { $year: '$updatedAt' } } }]
+    );
+    ordersCollection = collection;
     console.log('✅ MongoDB 連線成功');
   } catch (err) {
     console.error('❌ MongoDB 連線失敗:', err.message);
   }
 }
-connectMongo();
+if (!IS_TEST_RUNTIME) connectMongo();
 
 // 寫入一筆訂單紀錄到 MongoDB（供月結統計使用）；失敗不影響當天簡表功能
 async function saveOrderToMongo(groupId, date, key, order) {
   if (!ordersCollection) return;
   try {
+    const canonicalDate = normalizeDate(date);
+    if (!canonicalDate) throw new Error(`無效的服務日期：${date}`);
+    const serviceYear = extractServiceYear(order.date);
     await ordersCollection.updateOne(
-      { groupId, date, key },
-      { $set: { groupId, date, key, ...order, cancelled: false, updatedAt: new Date() } },
+      { groupId, serviceYear, date: canonicalDate, key },
+      { $set: {
+        ...order,
+        groupId,
+        date: canonicalDate,
+        serviceYear,
+        key,
+        cancelled: false,
+        updatedAt: new Date(),
+      } },
       { upsert: true }
     );
   } catch (err) {
@@ -55,7 +76,7 @@ async function markOrderCancelledInMongo(groupId, date, key) {
   if (!ordersCollection) return;
   try {
     await ordersCollection.updateOne(
-      { groupId, date, key },
+      { groupId, key, cancelled: false },
       { $set: { cancelled: true, updatedAt: new Date() } }
     );
   } catch (err) {
@@ -63,18 +84,36 @@ async function markOrderCancelledInMongo(groupId, date, key) {
   }
 }
 
-// ── 儲存：當天訂單（key=訂單編號, value=訂單資料）──
-// 格式: { [date]: { [orderId]: orderObj | null(取消) } }
+// ── 儲存：依 LINE 群組隔離的當天訂單 ──
+// 格式: { [groupId]: { [date]: { [orderId]: orderObj | null(取消) } } }
+// 不可只用日期當第一層，否則不同工作群組在同一天的訂單會互相看見或誤取消。
 const dailyOrders = {};
 
 // ── 計時器：2分鐘後發簡表 ──
 const pendingTimers = {}; // key=groupId+date
 
-// ── 是否有異動（取消/改派/拉回）──
-const hasChanges = {}; // key=date, value=true/false
+// ── 是否有異動（取消/改派/拉回），同樣依群組隔離 ──
+const hasChanges = {}; // 格式: { [groupId]: { [date]: true/false } }
 
 // ── 記錄每個群組最近一次訂單的日期，供無日期訊息（補單/交通車）歸類 ──
 const lastActiveDate = {}; // key=groupId, value=date string
+
+function ensureGroupState(groupId) {
+  if (!dailyOrders[groupId]) dailyOrders[groupId] = {};
+  if (!hasChanges[groupId]) hasChanges[groupId] = {};
+}
+
+function getDateOrders(groupId, date, create = false) {
+  if (create) ensureGroupState(groupId);
+  if (!dailyOrders[groupId]) return null;
+  if (create && !dailyOrders[groupId][date]) dailyOrders[groupId][date] = {};
+  return dailyOrders[groupId][date] || null;
+}
+
+function setChanged(groupId, date) {
+  ensureGroupState(groupId);
+  hasChanges[groupId][date] = true;
+}
 
 // ════════════════════════════════════════
 // 地點解析（完整版）
@@ -134,6 +173,59 @@ const DIST_MAP = {
   '屏東市':'屏東市','潮州鎮':'潮州','東港鎮':'東港','恆春鎮':'恆春',
 };
 
+// 全台 22 縣市、368 個鄉鎮市區。摘要統一顯示「縣市＋行政區」，
+// 例如「新北土城」「台中西屯」，避免只顯示區名或把未知區域誤判為台北。
+const REGIONS_BY_CITY = {
+  基隆: ['仁愛','信義','中正','中山','安樂','暖暖','七堵'],
+  台北: ['松山','信義','大安','中山','中正','大同','萬華','文山','南港','內湖','士林','北投'],
+  新北: ['萬里','金山','板橋','汐止','深坑','石碇','瑞芳','平溪','雙溪','貢寮','新店','坪林','烏來','永和','中和','土城','三峽','樹林','鶯歌','三重','新莊','泰山','林口','蘆洲','五股','八里','淡水','三芝','石門'],
+  桃園: ['桃園','中壢','平鎮','八德','楊梅','蘆竹','大溪','龜山','龍潭','新屋','觀音','復興','大園'],
+  新竹市: ['東','北','香山'],
+  新竹縣: ['竹北','關西','新埔','竹東','湖口','橫山','新豐','芎林','寶山','北埔','峨眉','尖石','五峰'],
+  苗栗: ['苗栗','苑裡','通霄','竹南','頭份','後龍','卓蘭','大湖','公館','銅鑼','南庄','頭屋','三義','西湖','造橋','三灣','獅潭','泰安'],
+  台中: ['中','東','南','西','北','西屯','南屯','北屯','豐原','東勢','大甲','清水','沙鹿','梧棲','后里','神岡','潭子','大雅','新社','石岡','外埔','大安','烏日','大肚','龍井','霧峰','太平','大里','和平'],
+  彰化: ['彰化','鹿港','和美','線西','伸港','福興','秀水','花壇','芬園','員林','溪湖','田中','大村','埔鹽','埔心','永靖','社頭','二水','北斗','二林','田尾','埤頭','芳苑','大城','竹塘','溪州'],
+  南投: ['南投','埔里','草屯','竹山','集集','名間','鹿谷','中寮','魚池','國姓','水里','信義','仁愛'],
+  雲林: ['斗六','斗南','虎尾','西螺','土庫','北港','古坑','大埤','莿桐','林內','二崙','崙背','麥寮','東勢','褒忠','台西','元長','四湖','口湖','水林'],
+  嘉義市: ['東','西'],
+  嘉義縣: ['太保','朴子','布袋','大林','民雄','溪口','新港','六腳','東石','義竹','鹿草','水上','中埔','竹崎','梅山','番路','大埔','阿里山'],
+  台南: ['中西','東','南','北','安平','安南','永康','歸仁','新化','左鎮','玉井','楠西','南化','仁德','關廟','龍崎','官田','麻豆','佳里','西港','七股','將軍','學甲','北門','新營','後壁','白河','東山','六甲','下營','柳營','鹽水','善化','大內','山上','新市','安定'],
+  高雄: ['鹽埕','鼓山','左營','楠梓','三民','新興','前金','苓雅','前鎮','旗津','小港','鳳山','林園','大寮','大樹','大社','仁武','鳥松','岡山','橋頭','燕巢','田寮','阿蓮','路竹','湖內','茄萣','永安','彌陀','梓官','旗山','美濃','六龜','甲仙','杉林','內門','茂林','桃源','那瑪夏'],
+  屏東: ['屏東','潮州','東港','恆春','萬丹','長治','麟洛','九如','里港','鹽埔','高樹','萬巒','內埔','竹田','新埤','枋寮','新園','崁頂','林邊','南州','佳冬','琉球','車城','滿州','枋山','三地門','霧台','瑪家','泰武','來義','春日','獅子','牡丹'],
+  宜蘭: ['宜蘭','羅東','蘇澳','頭城','礁溪','壯圍','員山','冬山','五結','三星','大同','南澳'],
+  花蓮: ['花蓮','鳳林','玉里','新城','吉安','壽豐','光復','豐濱','瑞穗','富里','秀林','萬榮','卓溪'],
+  台東: ['台東','成功','關山','卑南','鹿野','池上','東河','長濱','太麻里','大武','綠島','海端','延平','金峰','達仁','蘭嶼'],
+  澎湖: ['馬公','湖西','白沙','西嶼','望安','七美'],
+  金門: ['金城','金沙','金湖','金寧','烈嶼','烏坵'],
+  連江: ['南竿','北竿','莒光','東引'],
+};
+
+const CITY_ALIASES = {
+  '基隆市':'基隆','基隆':'基隆',
+  '臺北市':'台北','台北市':'台北','臺北':'台北','台北':'台北',
+  '新北市':'新北','新北':'新北','桃園市':'桃園','桃園':'桃園',
+  '新竹市':'新竹市','新竹縣':'新竹縣',
+  '苗栗縣':'苗栗','苗栗':'苗栗',
+  '臺中市':'台中','台中市':'台中','臺中':'台中','台中':'台中',
+  '彰化縣':'彰化','彰化':'彰化','南投縣':'南投','南投':'南投',
+  '雲林縣':'雲林','雲林':'雲林','嘉義市':'嘉義市','嘉義縣':'嘉義縣',
+  '臺南市':'台南','台南市':'台南','臺南':'台南','台南':'台南',
+  '高雄市':'高雄','高雄':'高雄','屏東縣':'屏東','屏東':'屏東',
+  '宜蘭縣':'宜蘭','宜蘭':'宜蘭','花蓮縣':'花蓮','花蓮':'花蓮',
+  '臺東縣':'台東','台東縣':'台東','臺東':'台東','台東':'台東',
+  '澎湖縣':'澎湖','澎湖':'澎湖','金門縣':'金門','金門':'金門',
+  '連江縣':'連江','連江':'連江',
+};
+
+const CITY_FULL_NAMES = {
+  基隆: '基隆市', 台北: '台北市', 新北: '新北市', 桃園: '桃園市',
+  新竹市: '新竹市', 新竹縣: '新竹縣', 苗栗: '苗栗縣', 台中: '台中市',
+  彰化: '彰化縣', 南投: '南投縣', 雲林: '雲林縣', 嘉義市: '嘉義市',
+  嘉義縣: '嘉義縣', 台南: '台南市', 高雄: '高雄市', 屏東: '屏東縣',
+  宜蘭: '宜蘭縣', 花蓮: '花蓮縣', 台東: '台東縣', 澎湖: '澎湖縣',
+  金門: '金門縣', 連江: '連江縣',
+};
+
 const REMARK_RULES = [
   { keys: ['舉牌','举牌','sign','placard'], label: '舉牌' },
   // 增高墊需在安椅之前判斷，因「前向式安全座椅（增高）」要優先歸類為增高墊
@@ -141,35 +233,72 @@ const REMARK_RULES = [
   { keys: ['兒童安全座椅','兒童座椅','安全座椅','嬰兒座椅','前向式安全座椅','向後式嬰兒安全座椅','向後式座椅','child seat','carseat'], label: '安椅' },
 ];
 
-function getCity(addr) {
-  const keys = Object.keys(CITY_MAP).sort((a,b) => b.length - a.length);
-  for (const k of keys) { if (addr.includes(k)) return CITY_MAP[k]; }
+function getCityMatch(addr) {
+  if (!addr) return null;
+  const aliases = Object.keys(CITY_ALIASES).sort((a,b) => b.length - a.length);
+  for (const alias of aliases) {
+    if (addr.includes(alias)) return { city: CITY_ALIASES[alias], alias };
+  }
   return null;
+}
+
+function getCity(addr) {
+  return getCityMatch(addr)?.city || null;
+}
+
+function findRegionInCity(addr, city) {
+  const regions = REGIONS_BY_CITY[city] || [];
+  for (const region of [...regions].sort((a, b) => b.length - a.length)) {
+    const matched = addr.match(new RegExp(`${region}([區鄉鎮市])`));
+    if (matched) return { region, suffix: matched[1] };
+  }
+  return null;
+}
+
+function findRegionWithoutCity(addr) {
+  // 先比對完整的官方行政區名稱，不能用任意「某某區」猜測縣市。
+  const candidates = [];
+  for (const [city, regions] of Object.entries(REGIONS_BY_CITY)) {
+    for (const region of regions) {
+      const matched = addr.match(new RegExp(`${region}([區鄉鎮市])`));
+      if (matched) candidates.push({ city, region, suffix: matched[1] });
+    }
+  }
+  if (!candidates.length) return null;
+
+  // 同名行政區（例如中正區、信義區）在地址缺少縣市時不可武斷猜測。
+  const firstRegion = candidates[0].region;
+  const sameRegion = candidates.filter(item => item.region === firstRegion);
+  return sameRegion.length === 1
+    ? sameRegion[0]
+    : { city: null, region: firstRegion, suffix: sameRegion[0].suffix };
 }
 
 function parseAddr(addr) {
   if (!addr || addr.match(/^桃園機場|^桃機|^機場|^松山機場/i)) return null;
-  const city = getCity(addr);
-  const distKeys = Object.keys(DIST_MAP).sort((a,b) => b.length - a.length);
-  for (const k of distKeys) {
-    if (addr.includes(k)) return (city || '台北') + DIST_MAP[k];
+  const normalized = addr.replace(/臺/g, '台');
+  const cityMatch = getCityMatch(normalized);
+  if (cityMatch) {
+    const { city, alias } = cityMatch;
+    // 先移除縣市名稱再找行政區，避免「桃園市蘆竹區」把前面的桃園市
+    // 誤當成「桃園區」，同理也適用苗栗縣苗栗市等同名情況。
+    const regionText = normalized.replace(alias, '');
+    const matched = findRegionInCity(regionText, city);
+    return matched
+      ? `${CITY_FULL_NAMES[city]}${matched.region}${matched.suffix}`
+      : CITY_FULL_NAMES[city];
   }
-  const m = addr.match(/[市縣]([^\s市縣，,\/\d]{2,3})[區鄉鎮市]/);
-  if (m && !m[1].match(/機場|桃機/)) return (city || '台北') + m[1];
-  return city || null;
+
+  const inferred = findRegionWithoutCity(normalized);
+  if (!inferred) return null;
+  if (!inferred.city) return `縣市待確認：${inferred.region}${inferred.suffix}`;
+  return `${CITY_FULL_NAMES[inferred.city]}${inferred.region}${inferred.suffix}`;
 }
 
-// 用於交通趟：沒有明確城市時，不強加「台北」，只回傳區名
+// 交通趟也必須清楚顯示縣市；無法判斷時直接標示待確認，不隱藏問題。
 function parseAddrNoDefault(addr) {
   if (!addr) return null;
-  const city = getCity(addr);
-  const distKeys = Object.keys(DIST_MAP).sort((a,b) => b.length - a.length);
-  for (const k of distKeys) {
-    if (addr.includes(k)) return (city || '') + DIST_MAP[k];
-  }
-  const m = addr.match(/[市縣]([^\s市縣，,\/\d]{2,3})[區鄉鎮市]/);
-  if (m) return (city || '') + m[1];
-  return city || addr.substring(0, 6);
+  return parseAddr(addr) || `地址待確認：${addr.trim().substring(0, 12)}`;
 }
 
 function splitBlocks(text) {
@@ -314,13 +443,13 @@ function parseTransferOrder(text) {
   const fromM = text.match(/搭車地區[：:]\s*(.+)/);
   const toM   = text.match(/下車地區[：:]\s*(.+)/);
   const paxM  = text.match(/乘車人數[：:]\s*(.+)/);
-  const priceM = text.match(/需付車資[：:]\s*(\d+)/);
+  const priceM = text.match(/需付車資[：:]\s*([\d,]+\.?\d*)/);
   if (!timeM) return null;
 
   const fromLoc = fromM ? parseAddrNoDefault(fromM[1].trim()) : null;
   const toLoc   = toM ? parseAddrNoDefault(toM[1].trim()) : null;
   const pax = paxM ? paxM[1].trim().replace(/\s/g,'') : '1人';
-  const price = priceM ? parseFloat(priceM[1]) : null;
+  const price = priceM ? parseFloat(priceM[1].replace(/,/g, '')) : null;
 
   return {
     orderId: null,
@@ -340,6 +469,7 @@ function parseTransferOrder(text) {
 function parseDriverReportOrder(text) {
   if (!text.match(/時間[：:]/) || !text.match(/貴賓[：:]/)) return null;
   const timeM = text.match(/時間[：:]\s*[\d\/]+_(\d{1,2}:\d{2})/) || text.match(/時間[：:].*?(\d{1,2}:\d{2})/);
+  const dateM = text.match(/時間[：:]\s*(\d{4}[\/-]\d{1,2}[\/-]\d{1,2}|\d{1,2}\/\d{1,2})/);
   const addrM = text.match(/地址[：:]\s*(.+)/);
   const paxM  = text.match(/人數行李[：:]\s*(\d+)\s*位/);
   const isReturn = text.match(/送機/);
@@ -371,7 +501,7 @@ function parseDriverReportOrder(text) {
     loc: loc || '',
     type: isReturn ? '送' : '接',
     remarks,
-    date: null,
+    date: dateM ? dateM[1] : null,
   };
 }
 
@@ -493,7 +623,7 @@ function parseOrders(text) {
 function toMin(t) { const [h,m]=t.split(':').map(Number); return h*60+m; }
 function fmtP(p) { return p%1===0 ? String(p) : p.toFixed(1); }
 
-function buildSummary(date, orders) {
+function buildSummary(groupId, date, orders) {
   const active = Object.values(orders).filter(o => o !== null);
   if (!active.length) return null;
   active.sort((a,b) => toMin(a.time) - toMin(b.time));
@@ -510,7 +640,7 @@ function buildSummary(date, orders) {
 
   let total = 0;
   let hasUnconfirmed = false;
-  const lines = [date + (hasChanges[date] ? '（更新）' : '')];
+  const lines = [date + (hasChanges[groupId]?.[date] ? '（更新）' : '')];
   active.forEach((o, i) => {
     // 補單佔位
     if (o.isPlaceholder) {
@@ -551,40 +681,88 @@ function buildSummary(date, orders) {
 // ════════════════════════════════════════
 // LINE API
 // ════════════════════════════════════════
+function toLineMessages(text) {
+  const maxLength = 4900; // LINE 單則文字上限 5000，預留安全空間
+  const chunks = [];
+  let current = '';
+  for (const line of String(text).split('\n')) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length <= maxLength) {
+      current = next;
+      continue;
+    }
+    if (current) chunks.push(current);
+    current = line;
+    while (current.length > maxLength) {
+      chunks.push(current.slice(0, maxLength));
+      current = current.slice(maxLength);
+    }
+  }
+  if (current) chunks.push(current);
+  if (chunks.length <= 5) return chunks.map(chunk => ({ type: 'text', text: chunk }));
+  return [
+    ...chunks.slice(0, 4).map(chunk => ({ type: 'text', text: chunk })),
+    { type: 'text', text: `${chunks[4].slice(0, 4800)}\n（內容過長，後續資料已省略，請分日期查詢）` },
+  ];
+}
+
 async function pushMessage(groupId, text) {
   await axios.post('https://api.line.me/v2/bot/message/push', {
     to: groupId,
-    messages: [{ type: 'text', text }]
+    messages: toLineMessages(text)
   }, {
-    headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}` }
+    headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}` },
+    timeout: 8000,
   });
 }
 
 async function replyMessage(replyToken, text) {
   await axios.post('https://api.line.me/v2/bot/message/reply', {
     replyToken,
-    messages: [{ type: 'text', text }]
+    messages: toLineMessages(text)
   }, {
-    headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}` }
+    headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}` },
+    timeout: 8000,
   });
 }
 
 // 尋找訂單所在日期：先精準比對key，找不到再用「去除所有空白後比對」寬鬆比對，
 // 避免因為訂單編號夾帶不可見字元或空白差異導致完全比對失敗
-function findOrderDate(orderId) {
+async function findOrderDate(groupId, orderId) {
   const normalizedTarget = orderId.replace(/\s/g, '');
-  for (const date of Object.keys(dailyOrders)) {
-    if (dailyOrders[date][orderId] !== undefined && dailyOrders[date][orderId] !== null) {
+  const groupOrders = dailyOrders[groupId] || {};
+  for (const date of Object.keys(groupOrders)) {
+    if (groupOrders[date][orderId] !== undefined && groupOrders[date][orderId] !== null) {
       return { date, key: orderId };
     }
   }
   // 寬鬆比對：去除空白後比較
-  for (const date of Object.keys(dailyOrders)) {
-    for (const key of Object.keys(dailyOrders[date])) {
-      if (dailyOrders[date][key] === null) continue;
+  for (const date of Object.keys(groupOrders)) {
+    for (const key of Object.keys(groupOrders[date])) {
+      if (groupOrders[date][key] === null) continue;
       if (key.replace(/\s/g, '') === normalizedTarget) {
         return { date, key };
       }
+    }
+  }
+
+  // Render 重新部署後記憶體會清空，改從 MongoDB 找回同群組的訂單。
+  if (ordersCollection) {
+    try {
+      const record = await ordersCollection.findOne({
+        groupId,
+        cancelled: false,
+        $or: [{ key: orderId }, { orderId }],
+      }, { sort: { updatedAt: -1 } });
+      if (record) {
+        const date = normalizeDate(record.date);
+        if (!date) return null;
+        const orders = getDateOrders(groupId, date, true);
+        orders[record.key] = record;
+        return { date, key: record.key };
+      }
+    } catch (err) {
+      console.error('MongoDB 訂單查找失敗:', err.message);
     }
   }
   return null;
@@ -596,10 +774,16 @@ function scheduleFlush(groupId, date) {
   if (pendingTimers[key]) clearTimeout(pendingTimers[key]);
   pendingTimers[key] = setTimeout(async () => {
     delete pendingTimers[key];
-    const orders = dailyOrders[date];
+    const orders = getDateOrders(groupId, date);
     if (!orders) return;
-    const summary = buildSummary(date, orders);
-    if (summary) await pushMessage(groupId, summary);
+    const summary = buildSummary(groupId, date, orders);
+    if (summary) {
+      try {
+        await pushMessage(groupId, summary);
+      } catch (err) {
+        console.error('LINE 定時簡表推送失敗:', err.response?.data || err.message);
+      }
+    }
   }, 5 * 60 * 1000); // 5分鐘
 }
 
@@ -611,9 +795,9 @@ async function sendOrScheduleSummary(replyToken, groupId, date) {
     return;
   }
 
-  const orders = dailyOrders[date];
+  const orders = getDateOrders(groupId, date);
   if (!orders) return;
-  const summary = buildSummary(date, orders);
+  const summary = buildSummary(groupId, date, orders);
   if (summary) await replyMessage(replyToken, summary);
 }
 
@@ -640,44 +824,77 @@ function verifySignature(req) {
 
 // 每分鐘檢查是否到23:50；記錄當天是否已執行，避免同一分鐘重複推送
 let lastScheduledDate = '';
-setInterval(async () => {
-  const now = new Date();
-  const h = now.getHours();
-  const m = now.getMinutes();
-  const dateStr = `${now.getMonth()+1}/${now.getDate()}`;
-  if (h === 23 && m === 50 && lastScheduledDate !== dateStr) {
+async function runDailyScheduler(now = new Date()) {
+  if (TEST_MODE) return; // 測試模式全面停用 Push，避免消耗每月額度
+  const businessNow = getBusinessDateParts(now);
+  const dateStr = `${businessNow.month}/${businessNow.day}`;
+  if (businessNow.hour === 23 && businessNow.minute === 50 && lastScheduledDate !== dateStr) {
     lastScheduledDate = dateStr;
     // 發當天有異動的簡表
-    if (hasChanges[dateStr] && dailyOrders[dateStr]) {
-      for (const groupId of Object.keys(groupIds)) {
-        const summary = buildSummary(dateStr, dailyOrders[dateStr]);
-        if (summary) await pushMessage(groupId, summary);
+    for (const groupId of Object.keys(groupIds)) {
+      if (hasChanges[groupId]?.[dateStr] && dailyOrders[groupId]?.[dateStr]) {
+        const summary = buildSummary(groupId, dateStr, dailyOrders[groupId][dateStr]);
+        if (summary) {
+          try {
+            await pushMessage(groupId, summary);
+          } catch (err) {
+            console.error('LINE 每日更新推送失敗:', err.response?.data || err.message);
+          }
+        }
       }
     }
   }
-}, 60 * 1000);
+}
+
+if (!IS_TEST_RUNTIME) {
+  setInterval(() => runDailyScheduler().catch(err => {
+    console.error('每日排程執行失敗:', err.message);
+  }), 60 * 1000);
+}
 
 // 記錄群組ID
 const groupIds = {};
+const sourceQueues = new Map();
+
+async function acquireSourceQueue(sourceId) {
+  const previous = (sourceQueues.get(sourceId) || Promise.resolve()).catch(() => {});
+  let releaseGate;
+  const gate = new Promise(resolve => { releaseGate = resolve; });
+  const tail = previous.then(() => gate);
+  sourceQueues.set(sourceId, tail);
+  await previous;
+  return () => {
+    releaseGate();
+    if (sourceQueues.get(sourceId) === tail) sourceQueues.delete(sourceId);
+  };
+}
 
 app.post('/webhook', async (req, res) => {
   if (!verifySignature(req)) return res.status(403).send('Forbidden');
-  res.sendStatus(200);
-
-  const events = req.body.events || [];
-  for (const event of events) {
+  try {
+    const events = req.body.events || [];
+    for (const event of events) {
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
     const rawText = event.message.text.trim();
     // 移除零寬字元、BOM等不可見字元，避免破壞正則比對（常見於手機輸入法/轉發訊息）
     const text = rawText.replace(/[\u200B-\u200D\uFEFF\u00A0]/g, (ch) => ch === '\u00A0' ? ' ' : '');
-    const sourceId = event.source.groupId || event.source.userId;
+    const sourceId = event.source.groupId || event.source.roomId || event.source.userId;
     if (!sourceId) continue;
-    groupIds[sourceId] = true;
+    const releaseSourceQueue = await acquireSourceQueue(sourceId);
+    try {
+      groupIds[sourceId] = true;
 
     // ── 測試指令：使用 Reply API，不計入每月 Push 訊息額度 ──
     if (text === '測試') {
       await replyMessage(event.replyToken, 'BOT 測試成功 ✅');
+      continue;
+    }
+
+    // ── 一次性資料修正：安全核對 9/7 的正確 8 趟後，排除其餘誤存紀錄 ──
+    if (text.replace(/\s/g, '') === '修正9/7') {
+      const result = await repairSeptember7(sourceId);
+      await replyMessage(event.replyToken, result);
       continue;
     }
 
@@ -693,12 +910,14 @@ app.post('/webhook', async (req, res) => {
     const cancelM = text.match(/([A-Z0-9]{6,15})\s*(訂單取消|取消)/);
     if (cancelM) {
       const orderId = cancelM[1];
-      const found = findOrderDate(orderId);
+      const found = await findOrderDate(sourceId, orderId);
       if (found) {
-        dailyOrders[found.date][found.key] = null;
-        hasChanges[found.date] = true;
+        getDateOrders(sourceId, found.date, true)[found.key] = null;
+        setChanged(sourceId, found.date);
         await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
-        markOrderCancelledInMongo(sourceId, found.date, found.key);
+        await markOrderCancelledInMongo(sourceId, found.date, found.key);
+      } else {
+        await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有取消任何資料。`);
       }
       continue;
     }
@@ -707,12 +926,14 @@ app.post('/webhook', async (req, res) => {
     const pullReassignM = text.match(/拉回改派\s*([A-Z0-9]{6,15})/);
     if (pullReassignM) {
       const orderId = pullReassignM[1];
-      const found = findOrderDate(orderId);
+      const found = await findOrderDate(sourceId, orderId);
       if (found) {
-        dailyOrders[found.date][found.key] = null;
-        hasChanges[found.date] = true;
+        getDateOrders(sourceId, found.date, true)[found.key] = null;
+        setChanged(sourceId, found.date);
         await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
-        markOrderCancelledInMongo(sourceId, found.date, found.key);
+        await markOrderCancelledInMongo(sourceId, found.date, found.key);
+      } else {
+        await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有拉回或改派任何資料。`);
       }
       continue;
     }
@@ -721,20 +942,28 @@ app.post('/webhook', async (req, res) => {
     const reassignM = text.match(/([A-Z0-9]{6,15})\s*改派/);
     if (reassignM) {
       const oldId = reassignM[1];
-      const found = findOrderDate(oldId);
-      if (found) {
-        dailyOrders[found.date][found.key] = null;
-        hasChanges[found.date] = true;
-        markOrderCancelledInMongo(sourceId, found.date, found.key);
-      }
       const newOrders = parseOrders(text);
+      // 必須先確認新訂單完整可辨識，才取消舊訂單，避免改派訊息格式錯誤造成原單遺失。
+      if (!newOrders.length || newOrders.some(order => !normalizeDate(order.date))) {
+        await replyMessage(event.replyToken, `改派停止：無法辨識新訂單內容，舊訂單 ${oldId} 未變更。`);
+        continue;
+      }
+      const found = await findOrderDate(sourceId, oldId);
+      if (found) {
+        getDateOrders(sourceId, found.date, true)[found.key] = null;
+        setChanged(sourceId, found.date);
+        await markOrderCancelledInMongo(sourceId, found.date, found.key);
+      } else {
+        await replyMessage(event.replyToken, `改派停止：找不到舊訂單 ${oldId}，沒有變更任何資料。`);
+        continue;
+      }
       for (const o of newOrders) {
         const date = normalizeDate(o.date);
-        if (!dailyOrders[date]) dailyOrders[date] = {};
+        const orders = getDateOrders(sourceId, date, true);
         const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
-        dailyOrders[date][key] = o;
-        hasChanges[date] = true;
-        saveOrderToMongo(sourceId, date, key, o);
+        orders[key] = o;
+        setChanged(sourceId, date);
+        await saveOrderToMongo(sourceId, date, key, o);
       }
       const date = found ? found.date : normalizeDate(newOrders[0]?.date);
       await sendOrScheduleSummary(event.replyToken, sourceId, date);
@@ -746,13 +975,17 @@ app.post('/webhook', async (req, res) => {
     if (pullbackM) {
       if (pullbackM[1]) {
         const orderId = pullbackM[1];
-        const found = findOrderDate(orderId);
+        const found = await findOrderDate(sourceId, orderId);
         if (found) {
-          dailyOrders[found.date][found.key] = null;
-          hasChanges[found.date] = true;
+          getDateOrders(sourceId, found.date, true)[found.key] = null;
+          setChanged(sourceId, found.date);
           await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
-          markOrderCancelledInMongo(sourceId, found.date, found.key);
+          await markOrderCancelledInMongo(sourceId, found.date, found.key);
+        } else {
+          await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有拉回任何資料。`);
         }
+      } else {
+        await replyMessage(event.replyToken, '拉回停止：訊息中沒有訂單編號，請輸入「訂單編號 拉回」。');
       }
       continue;
     }
@@ -768,15 +1001,15 @@ app.post('/webhook', async (req, res) => {
       const hour = parseInt(placeholderM[1]);
       const type = placeholderM[2];
       const date = lastActiveDate[sourceId] || getTodayStr();
-      if (!dailyOrders[date]) dailyOrders[date] = {};
+      const orders = getDateOrders(sourceId, date, true);
       const key = `placeholder|${hour}|${type}`;
-      dailyOrders[date][key] = {
+      orders[key] = {
         isPlaceholder: true,
         hour, type,
         time: `${String(hour).padStart(2,'0')}:00`,
         display: `補${hour}${type}`,
       };
-      hasChanges[date] = true;
+      setChanged(sourceId, date);
       await sendOrScheduleSummary(event.replyToken, sourceId, date);
       continue;
     }
@@ -789,14 +1022,14 @@ app.post('/webhook', async (req, res) => {
       const label = shuttleM[2];
       const paxNote = shuttleM[3] || '';
       const date = lastActiveDate[sourceId] || getTodayStr();
-      if (!dailyOrders[date]) dailyOrders[date] = {};
+      const orders = getDateOrders(sourceId, date, true);
       const key = `shuttle|${time}|${label}`;
-      dailyOrders[date][key] = {
+      orders[key] = {
         isShuttle: true,
         time,
         display: paxNote ? `${label}，${paxNote}` : label,
       };
-      hasChanges[date] = true;
+      setChanged(sourceId, date);
       await sendOrScheduleSummary(event.replyToken, sourceId, date);
       continue;
     }
@@ -810,42 +1043,97 @@ app.post('/webhook', async (req, res) => {
 
     if (looksLikeOrder) {
       const newOrders = parseOrders(text);
+      if (!newOrders.length || newOrders.some(order => !normalizeDate(order.date))) {
+        await replyMessage(event.replyToken, '訂單格式無法完整辨識，沒有儲存任何資料。請檢查日期、時間與結算價。');
+        continue;
+      }
       for (const o of newOrders) {
         const date = normalizeDate(o.date);
         lastActiveDate[sourceId] = date; // 記錄最近使用的日期
-        if (!dailyOrders[date]) dailyOrders[date] = {};
+        const orders = getDateOrders(sourceId, date, true);
 
         // 檢查是否能取代某個補單佔位（同方向 + 同整點時段）
         const oHour = parseInt(o.time.split(':')[0]);
         const oType = o.type === '接' ? '接' : '送';
         const placeholderKey = `placeholder|${oHour}|${oType}`;
-        if (dailyOrders[date][placeholderKey] && dailyOrders[date][placeholderKey].isPlaceholder) {
-          delete dailyOrders[date][placeholderKey];
+        if (orders[placeholderKey] && orders[placeholderKey].isPlaceholder) {
+          delete orders[placeholderKey];
         }
 
         const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
-        dailyOrders[date][key] = o;
-        saveOrderToMongo(sourceId, date, key, o);
+        orders[key] = o;
+        await saveOrderToMongo(sourceId, date, key, o);
       }
       const date = normalizeDate(newOrders[0]?.date);
       if (newOrders.length) await sendOrScheduleSummary(event.replyToken, sourceId, date);
     }
+    } finally {
+      releaseSourceQueue();
+    }
+    }
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error('Webhook 處理失敗:', err.response?.data || err.message);
+    // 回傳 500 讓 LINE 可以重送；MongoDB 寫入採 upsert，重送不會重複累加。
+    return res.status(500).send('Webhook processing failed');
   }
 });
 
-function getTodayStr() {
-  const now = new Date();
-  return `${now.getMonth()+1}/${now.getDate()}`;
+function getBusinessDateParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: BUSINESS_TIME_ZONE,
+    year: 'numeric', month: 'numeric', day: 'numeric',
+    hour: 'numeric', minute: 'numeric', hourCycle: 'h23',
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+    hour: Number(values.hour),
+    minute: Number(values.minute),
+  };
+}
+
+function getTodayStr(date = new Date()) {
+  const now = getBusinessDateParts(date);
+  return `${now.month}/${now.day}`;
+}
+
+function extractServiceYear(dateStr) {
+  if (dateStr) {
+    const fullDate = String(dateStr).match(/(\d{4})[-\/]\d{1,2}[-\/]\d{1,2}/);
+    if (fullDate) return Number(fullDate[1]);
+  }
+  return getBusinessDateParts().year;
 }
 
 // 統一日期格式為 M/D（處理 2026-06-27、2026/07/23、7/21 等格式）
 function normalizeDate(dateStr) {
   if (!dateStr) return getTodayStr();
-  const m = dateStr.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
-  if (m) return `${parseInt(m[2])}/${parseInt(m[3])}`;
-  const m2 = dateStr.match(/^(\d{1,2})\/(\d{1,2})$/);
-  if (m2) return dateStr;
-  return getTodayStr();
+  const m = String(dateStr).match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (m) {
+    const year = Number(m[1]);
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    return isValidCalendarDate(year, month, day) ? `${month}/${day}` : null;
+  }
+  const m2 = String(dateStr).match(/^(\d{1,2})\/(\d{1,2})$/);
+  if (m2) {
+    const { year } = getBusinessDateParts();
+    const month = Number(m2[1]);
+    const day = Number(m2[2]);
+    return isValidCalendarDate(year, month, day) ? `${month}/${day}` : null;
+  }
+  return null;
+}
+
+function isValidCalendarDate(year, month, day) {
+  if (![year, month, day].every(Number.isInteger)) return false;
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year &&
+    date.getUTCMonth() === month - 1 &&
+    date.getUTCDate() === day;
 }
 
 // ════════════════════════════════════════
@@ -855,15 +1143,143 @@ function normalizeDate(dateStr) {
 // 中文數字/阿拉伯數字月份解析：「月結」「月結 8月」「月結8」
 function parseMonthCommand(text) {
   const m = text.match(/^月結\s*(\d{1,2})\s*月?$/);
-  if (m) return parseInt(m[1]);
+  if (m) {
+    const month = parseInt(m[1]);
+    return month >= 1 && month <= 12 ? month : null;
+  }
   if (text.trim() === '月結') {
-    return new Date().getMonth() + 1; // 當月
+    return getBusinessDateParts().month; // 台灣時間的當月
   }
   return null;
 }
 
+// 一次性修正 9/7 資料：
+// 1. 限測試模式使用。
+// 2. 必須完整找到以下 8 趟，任何一趟不吻合便整批停止。
+// 3. 多餘紀錄只標記為取消，不永久刪除，保留回復可能。
+async function repairSeptember7(groupId) {
+  if (!TEST_MODE) {
+    return '安全保護：只有 TEST_MODE=true 時才能執行「修正9/7」。';
+  }
+  if (!ordersCollection) {
+    return '修正停止：資料庫目前未連線，沒有變更任何資料。';
+  }
+
+  const expectedOrders = [
+    { time: '00:10', type: '接', loc: ['台北土城','新北土城','新北市土城區'], pax: 2, price: 866 },
+    { time: '02:15', type: '接', loc: ['新北中和','新北市中和區'], pax: 1, price: 637 },
+    { time: '05:00', type: '送', loc: ['新北新店','新北市新店區'], pax: 1, price: 983 },
+    { time: '08:30', type: '送', loc: ['新北板橋','新北市板橋區'], pax: 1, price: 665 },
+    { time: '10:30', type: '送', loc: ['台北萬華','台北市萬華區'], pax: 4, price: 650 },
+    { time: '11:00', type: '接', loc: ['台北中正','台北市中正區'], pax: 1, price: 637 },
+    { time: '14:00', type: '送', loc: ['台北中正','台北市中正區'], pax: 1, price: 530 },
+    { time: '15:20', type: '接', loc: ['台北北投','台北市北投區'], pax: 1, price: 750 },
+  ];
+
+  try {
+    const records = await ordersCollection.find({
+      groupId,
+      serviceYear: 2026,
+      cancelled: false,
+      date: { $regex: /^0?9\/0?7$/ },
+    }).sort({ updatedAt: -1 }).toArray();
+
+    const usedIds = new Set();
+    const keptRecords = [];
+    const missing = [];
+
+    for (const expected of expectedOrders) {
+      const matched = records.find(record => {
+        const recordId = String(record._id);
+        if (usedIds.has(recordId)) return false;
+        return String(record.time || '').trim() === expected.time &&
+          record.type === expected.type &&
+          expected.loc.includes(String(record.loc || '').trim()) &&
+          parseInt(String(record.pax), 10) === expected.pax &&
+          Number(record.price) === expected.price;
+      });
+
+      if (!matched) {
+        missing.push(`${expected.time} ${expected.type}${expected.loc[expected.loc.length - 1]} ${expected.pax}人 ${fmtP(expected.price)}`);
+        continue;
+      }
+
+      usedIds.add(String(matched._id));
+      keptRecords.push(matched);
+    }
+
+    if (missing.length) {
+      return [
+        '修正停止：資料庫中的資料無法完整對上正確的 8 趟，因此沒有變更任何資料。',
+        '未找到：',
+        ...missing.map(item => `・${item}`),
+      ].join('\n');
+    }
+
+    const extraRecords = records.filter(record => !usedIds.has(String(record._id)));
+    const correctedAt = new Date();
+    const operations = [
+      ...keptRecords.map(record => ({
+        updateOne: {
+          filter: { _id: record._id },
+          update: {
+            $set: {
+              date: '9/7',
+              serviceYear: 2026,
+              cancelled: false,
+              verifiedByCorrection: true,
+              correctedAt,
+            },
+          },
+        },
+      })),
+      ...extraRecords.map(record => ({
+        updateOne: {
+          filter: { _id: record._id },
+          update: {
+            $set: {
+              cancelled: true,
+              correctionReason: '9/7人工核對：不在正確8趟名單內',
+              correctedAt,
+            },
+          },
+        },
+      })),
+    ];
+
+    if (operations.length) {
+      // MongoDB Atlas 支援交易：正式環境整批成功或整批回復，避免只修到一半。
+      const session = mongoClient?.startSession ? mongoClient.startSession() : null;
+      if (session) {
+        try {
+          await session.withTransaction(async () => {
+            await ordersCollection.bulkWrite(operations, { ordered: true, session });
+          });
+        } finally {
+          await session.endSession();
+        }
+      } else {
+        // 自動化測試使用的假資料庫沒有 session。
+        await ordersCollection.bulkWrite(operations, { ordered: true });
+      }
+    }
+
+    const report = await buildMonthlyReport(groupId, 9, 2026);
+    return [
+      '9/7 修正完成 ✅',
+      `保留：${keptRecords.length} 趟`,
+      `排除多餘紀錄：${extraRecords.length} 筆（僅標記取消，未永久刪除）`,
+      '',
+      report,
+    ].join('\n');
+  } catch (err) {
+    console.error('9/7 資料修正失敗:', err.message);
+    return '修正失敗：資料庫操作發生錯誤，請查看 Render Logs；請勿重複輸入，先聯繫管理員確認。';
+  }
+}
+
 // 從 MongoDB 撈出指定月份「未取消」的訂單，計算統計數據
-async function buildMonthlyReport(groupId, month) {
+async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().year) {
   if (!ordersCollection) {
     return '月結功能目前無法使用（資料庫未連線），請聯繫管理員確認設定。';
   }
@@ -875,6 +1291,7 @@ async function buildMonthlyReport(groupId, month) {
   try {
     records = await ordersCollection.find({
       groupId,
+      serviceYear: year,
       cancelled: false,
       date: { $regex: datePattern },
     }).toArray();
@@ -887,7 +1304,7 @@ async function buildMonthlyReport(groupId, month) {
   const validOrders = records.filter(r => typeof r.price === 'number');
 
   if (!validOrders.length) {
-    return `${month}月尚無有效訂單紀錄，無法產生月結報表。`;
+    return `${year}年${month}月尚無有效訂單紀錄，無法產生月結報表。`;
   }
 
   let total = 0;
@@ -923,7 +1340,7 @@ async function buildMonthlyReport(groupId, month) {
   const lastDate = sortedDates[sortedDates.length - 1];
 
   const lines = [];
-  lines.push(`${month}月結算報表`);
+  lines.push(`${year}年${month}月結算報表`);
   lines.push(`資料涵蓋：${firstDate}${firstDate === lastDate ? '' : `～${lastDate}`}`);
   lines.push('統計口徑：未取消且金額已確認');
   lines.push(`總趟數：${tripCount} 趟`);
@@ -943,36 +1360,105 @@ async function buildMonthlyReport(groupId, month) {
 }
 
 app.get('/', (req, res) => res.send('訂單簡表 Bot 運行中 ✅'));
+app.get('/health', (req, res) => {
+  const databaseReady = Boolean(ordersCollection);
+  const status = databaseReady ? 200 : 503;
+  res.status(status).json({
+    status: databaseReady ? 'ok' : 'degraded',
+    lineConfigured: Boolean(CHANNEL_SECRET && CHANNEL_ACCESS_TOKEN),
+    databaseReady,
+    testMode: TEST_MODE,
+    timeZone: BUSINESS_TIME_ZONE,
+  });
+});
 
 // 每天檢查是否為月底最後一天 23:50，自動發送當月月結
 let lastMonthlyReportSent = ''; // 記錄格式 'YYYY-MM'，避免同月重複發送
-setInterval(async () => {
-  const now = new Date();
-  const h = now.getHours();
-  const min = now.getMinutes();
-  if (h !== 23 || min !== 50) return;
+async function getKnownGroupIds() {
+  const ids = new Set(Object.keys(groupIds));
+  if (ordersCollection) {
+    try {
+      const persistedIds = await ordersCollection.distinct('groupId');
+      persistedIds.filter(Boolean).forEach(id => ids.add(id));
+    } catch (err) {
+      console.error('MongoDB 群組清單查詢失敗:', err.message);
+    }
+  }
+  return [...ids];
+}
 
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-  const isLastDayOfMonth = tomorrow.getMonth() !== now.getMonth();
-  if (!isLastDayOfMonth) return;
+async function runMonthlyScheduler(now = new Date()) {
+  if (TEST_MODE) return; // 月結仍可手動輸入「月結」以 Reply API 查詢
+  const businessNow = getBusinessDateParts(now);
+  if (businessNow.hour !== 23 || businessNow.minute !== 50) return;
 
-  const monthKey = `${now.getFullYear()}-${now.getMonth() + 1}`;
+  const lastDay = new Date(Date.UTC(businessNow.year, businessNow.month, 0)).getUTCDate();
+  if (businessNow.day !== lastDay) return;
+
+  const monthKey = `${businessNow.year}-${businessNow.month}`;
   if (lastMonthlyReportSent === monthKey) return;
   lastMonthlyReportSent = monthKey;
 
-  const month = now.getMonth() + 1;
-  for (const groupId of Object.keys(groupIds)) {
-    const report = await buildMonthlyReport(groupId, month);
-    await pushMessage(groupId, report);
+  for (const groupId of await getKnownGroupIds()) {
+    const report = await buildMonthlyReport(groupId, businessNow.month, businessNow.year);
+    try {
+      await pushMessage(groupId, report);
+    } catch (err) {
+      console.error('LINE 月結推送失敗:', err.response?.data || err.message);
+    }
   }
-}, 60 * 1000);
+}
+
+if (!IS_TEST_RUNTIME) {
+  setInterval(() => runMonthlyScheduler().catch(err => {
+    console.error('月結排程執行失敗:', err.message);
+  }), 60 * 1000);
+}
 
 // ── 防止 Render 免費方案休眠：每 13 分鐘自我 ping 一次 ──
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || 'https://order-bot-45x0.onrender.com';
-setInterval(() => {
-  axios.get(SELF_URL).catch(() => {}); // 失敗也沒關係，純粹是為了保持喚醒
-}, 13 * 60 * 1000);
+if (!IS_TEST_RUNTIME) {
+  setInterval(() => {
+    axios.get(SELF_URL).catch(() => {}); // 失敗也沒關係，純粹是為了保持喚醒
+  }, 13 * 60 * 1000);
+}
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+if (!IS_TEST_RUNTIME) {
+  app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+}
+
+// 只供自動化測試使用；正式執行時不影響 Bot 行為。
+module.exports = {
+  app,
+  REGIONS_BY_CITY,
+  parseAddr,
+  parseAddrNoDefault,
+  parseOrders,
+  parseTransferOrder,
+  parseDriverReportOrder,
+  parseTableOrder,
+  toLineMessages,
+  buildSummary,
+  normalizeDate,
+  extractServiceYear,
+  getBusinessDateParts,
+  getTodayStr,
+  parseMonthCommand,
+  verifySignature,
+  getDateOrders,
+  setChanged,
+  findOrderDate,
+  runDailyScheduler,
+  runMonthlyScheduler,
+  acquireSourceQueue,
+  saveOrderToMongo,
+  markOrderCancelledInMongo,
+  buildMonthlyReport,
+  repairSeptember7,
+  __setOrdersCollectionForTests(collection) {
+    if (!IS_TEST_RUNTIME) throw new Error('僅限測試環境');
+    ordersCollection = collection;
+  },
+  __state: { dailyOrders, hasChanges, lastActiveDate, groupIds },
+};
