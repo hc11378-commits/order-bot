@@ -12,7 +12,7 @@ const MONGO_URI = process.env.MONGO_URI?.trim(); // 例如 mongodb+srv://user:pa
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '1.2.0-diagnostic';
+const BOT_VERSION = '1.2.1-diagnostic';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -903,9 +903,11 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
-    // 只讀診斷：不新增、不取消、不修改任何訂單。
-    if (text.replace(/\s/g, '') === '群組診斷') {
-      const report = await buildGroupDiagnostic(sourceId, auditContext);
+    // 只讀診斷：可指定服務日，例如「群組診斷 9/10」。
+    // 不新增、不取消、不修改任何訂單。
+    const diagnosticMatch = text.match(/^群組診斷(?:\s*(\d{1,2}\/\d{1,2}))?$/);
+    if (diagnosticMatch) {
+      const report = await buildGroupDiagnostic(sourceId, auditContext, new Date(), diagnosticMatch[1] || null);
       await replyMessage(event.replyToken, report);
       continue;
     }
@@ -1174,12 +1176,37 @@ function parseMonthCommand(text) {
   return null;
 }
 
-// 群組隔離診斷：只讀取執行指令的群組與台灣當日資料。
-async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()) {
+// 群組隔離診斷：只讀取執行指令的群組。
+// 訂單通常會提前調派，因此「執行時間」與「檢查服務日」必須分開顯示。
+async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date(), requestedDate = null) {
   const businessNow = getBusinessDateParts(now);
-  const date = `${businessNow.month}/${businessNow.day}`;
+  const executionDate = `${businessNow.month}/${businessNow.day}`;
+  let date = requestedDate
+    ? normalizeDate(requestedDate)
+    : (lastActiveDate[groupId] ? normalizeDate(lastActiveDate[groupId]) : null);
+  let serviceYear = businessNow.year;
   const groupCode = anonymizeId(groupId);
   const senderCode = anonymizeId(auditContext.senderId);
+
+  if (requestedDate && !date) {
+    return `群組診斷停止：「${requestedDate}」不是有效日期，沒有修改任何資料。\n請使用例如「群組診斷 9/10」。`;
+  }
+
+  // 沒指定日期且本機沒有該群組的最近日期時，從 MongoDB 只找該群組最近更新的有效訂單。
+  if (!requestedDate && !date && ordersCollection) {
+    try {
+      const latest = await ordersCollection.find({ groupId, cancelled: false })
+        .sort({ updatedAt: -1 }).limit(1).toArray();
+      if (latest[0]) {
+        date = normalizeDate(latest[0].date);
+        serviceYear = Number(latest[0].serviceYear) || businessNow.year;
+      }
+    } catch (err) {
+      console.error('群組最近服務日查詢失敗:', err.message);
+    }
+  }
+
+  if (!date) date = executionDate;
   const memoryOrders = Object.values(getDateOrders(groupId, date) || {})
     .filter(order => order && !order.isPlaceholder && !order.isShuttle);
 
@@ -1187,7 +1214,8 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
     return [
       '群組診斷（只讀）',
       `Bot版本：${BOT_VERSION}`,
-      `台灣時間：${date} ${String(businessNow.hour).padStart(2, '0')}:${String(businessNow.minute).padStart(2, '0')}`,
+      `執行時間：${executionDate} ${String(businessNow.hour).padStart(2, '0')}:${String(businessNow.minute).padStart(2, '0')}`,
+      `檢查服務日：${date}`,
       `群組代碼：${groupCode}`,
       `發送者代碼：${senderCode}`,
       `群組類型：${auditContext.conversationType || 'unknown'}`,
@@ -1199,7 +1227,7 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
   try {
     const records = await ordersCollection.find({
       groupId,
-      serviceYear: businessNow.year,
+      serviceYear,
       date,
       cancelled: false,
     }).sort({ time: 1, updatedAt: 1 }).toArray();
@@ -1215,7 +1243,8 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
     return [
       '群組診斷（只讀，未修改資料）',
       `Bot版本：${BOT_VERSION}`,
-      `台灣時間：${date} ${String(businessNow.hour).padStart(2, '0')}:${String(businessNow.minute).padStart(2, '0')}`,
+      `執行時間：${executionDate} ${String(businessNow.hour).padStart(2, '0')}:${String(businessNow.minute).padStart(2, '0')}`,
+      `檢查服務日：${date}`,
       `群組代碼：${groupCode}`,
       `發送者代碼：${senderCode}`,
       `群組類型：${auditContext.conversationType || 'unknown'}`,
@@ -1223,7 +1252,7 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
       `MongoDB有效訂單：${validOrders.length} 筆`,
       `MongoDB金額：${fmtP(total)}`,
       `資料內發單者：${senderKeys.size} 種（舊資料可能沒有發送者代碼）`,
-      '今日訂單：',
+      '服務日訂單：',
       ...(orderLines.length ? orderLines : ['無']),
     ].join('\n');
   } catch (err) {

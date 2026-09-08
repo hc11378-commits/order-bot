@@ -313,13 +313,135 @@ test('三個實際群組會產生不同匿名代碼且診斷只查自己的 grou
   for (const groupId of ['actual-group-1', 'actual-group-2', 'actual-group-3']) {
     reports.push(await bot.buildGroupDiagnostic(groupId, {
       senderId: `user-${groupId}`, conversationType: 'group',
-    }, now));
+    }, now, '9/10'));
   }
   assert.deepEqual(queriedGroups, ['actual-group-1', 'actual-group-2', 'actual-group-3']);
   const codes = reports.map(report => report.match(/群組代碼：(\w+)/)[1]);
   assert.equal(new Set(codes).size, 3);
+  assert.match(reports[0], /執行時間：9\/10 12:00/);
+  assert.match(reports[0], /檢查服務日：9\/10/);
   assert.match(reports[0], /MongoDB金額：701/);
   assert.doesNotMatch(reports[0], /703/);
+});
+
+test('執行日9/8可明確診斷9/10預派單，且查詢不會離開當前群組', async () => {
+  let capturedQuery;
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      capturedQuery = query;
+      return {
+        sort() { return this; },
+        async toArray() {
+          return [{ time: '08:30', type: '送', loc: '新北市板橋區', price: 665, senderKey: 'sender-a' }];
+        },
+      };
+    },
+  });
+  const report = await bot.buildGroupDiagnostic(
+    'future-service-group',
+    { senderId: 'future-user', conversationType: 'group' },
+    new Date('2026-09-08T10:00:00.000Z'),
+    '9/10'
+  );
+  assert.deepEqual(capturedQuery, {
+    groupId: 'future-service-group', serviceYear: 2026, date: '9/10', cancelled: false,
+  });
+  assert.match(report, /執行時間：9\/8 18:00/);
+  assert.match(report, /檢查服務日：9\/10/);
+  assert.match(report, /服務日訂單：/);
+  assert.match(report, /新北市板橋區送/);
+});
+
+test('群組診斷未指定日期時，只從該群組自動找最近服務日', async () => {
+  const queries = [];
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      queries.push(query);
+      if (queries.length === 1) {
+        return {
+          sort() { return this; }, limit() { return this; },
+          async toArray() { return [{ date: '9/10', serviceYear: 2026, updatedAt: new Date() }]; },
+        };
+      }
+      return {
+        sort() { return this; },
+        async toArray() { return [{ time: '02:15', type: '接', loc: '新北市中和區', price: 637 }]; },
+      };
+    },
+  });
+  const report = await bot.buildGroupDiagnostic(
+    'auto-latest-group',
+    { senderId: 'auto-user', conversationType: 'group' },
+    new Date('2026-09-08T10:00:00.000Z')
+  );
+  assert.deepEqual(queries[0], { groupId: 'auto-latest-group', cancelled: false });
+  assert.deepEqual(queries[1], {
+    groupId: 'auto-latest-group', serviceYear: 2026, date: '9/10', cancelled: false,
+  });
+  assert.match(report, /執行時間：9\/8 18:00/);
+  assert.match(report, /檢查服務日：9\/10/);
+});
+
+test('群組診斷的無效服務日會安全停止且不查詢資料庫', async () => {
+  let databaseCalled = false;
+  bot.__setOrdersCollectionForTests({
+    find() { databaseCalled = true; throw new Error('不應執行'); },
+  });
+  const report = await bot.buildGroupDiagnostic(
+    'invalid-date-group',
+    { senderId: 'invalid-user', conversationType: 'group' },
+    new Date('2026-09-08T10:00:00.000Z'),
+    '13/40'
+  );
+  assert.match(report, /不是有效日期/);
+  assert.match(report, /沒有修改任何資料/);
+  assert.equal(databaseCalled, false);
+});
+
+test('webhook 可接收「群組診斷 9/10」並只回覆該群組的服務日資料', async () => {
+  let capturedQuery;
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      capturedQuery = query;
+      return {
+        sort() { return this; },
+        async toArray() {
+          return [{ time: '15:20', type: '接', loc: '台北市北投區', price: 750 }];
+        },
+      };
+    },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'diagnostic-reply',
+    source: { type: 'group', groupId: 'diagnostic-command-group', userId: 'diagnostic-user' },
+    message: { type: 'text', id: 'diagnostic-message', text: '群組診斷 9/10' },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-line-signature': signature },
+      body,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(capturedQuery.groupId, 'diagnostic-command-group');
+    assert.equal(capturedQuery.date, '9/10');
+    assert.match(replyText, /檢查服務日：9\/10/);
+    assert.match(replyText, /接台北市北投區/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
 });
 
 test('匿名識別碼固定且不同群組不會相同', () => {
