@@ -294,6 +294,40 @@ test('月結只統計指定群組、年份、月份、未取消且有數字金�
   assert.match(report, /客收總額：200（共1筆）/);
 });
 
+test('三個實際群組會產生不同匿名代碼且診斷只查自己的 groupId', async () => {
+  const queriedGroups = [];
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      queriedGroups.push(query.groupId);
+      const suffix = query.groupId.slice(-1);
+      return {
+        sort() { return this; },
+        async toArray() {
+          return [{ time: `0${suffix}:00`, type: '接', loc: '新北市板橋區', price: 700 + Number(suffix), senderKey: `sender-${suffix}` }];
+        },
+      };
+    },
+  });
+  const now = new Date('2026-09-10T04:00:00.000Z');
+  const reports = [];
+  for (const groupId of ['actual-group-1', 'actual-group-2', 'actual-group-3']) {
+    reports.push(await bot.buildGroupDiagnostic(groupId, {
+      senderId: `user-${groupId}`, conversationType: 'group',
+    }, now));
+  }
+  assert.deepEqual(queriedGroups, ['actual-group-1', 'actual-group-2', 'actual-group-3']);
+  const codes = reports.map(report => report.match(/群組代碼：(\w+)/)[1]);
+  assert.equal(new Set(codes).size, 3);
+  assert.match(reports[0], /MongoDB金額：701/);
+  assert.doesNotMatch(reports[0], /703/);
+});
+
+test('匿名識別碼固定且不同群組不會相同', () => {
+  assert.equal(bot.anonymizeId('group-A'), bot.anonymizeId('group-A'));
+  assert.notEqual(bot.anonymizeId('group-A'), bot.anonymizeId('group-B'));
+  assert.equal(bot.anonymizeId('group-A').length, 10);
+});
+
 test('9/7 修正資料不完整時整批停止且不寫入', async () => {
   let bulkWriteCalled = false;
   bot.__setOrdersCollectionForTests({
@@ -393,7 +427,7 @@ test('完整 webhook 流程可接單、寫入 MongoDB 並用 Reply API 回覆', 
   ].join('\n');
   const body = JSON.stringify({ events: [{
     type: 'message', webhookEventId: 'event-test-1', replyToken: 'reply-test-1',
-    source: { type: 'group', groupId: 'live-group' },
+    source: { type: 'group', groupId: 'live-group', userId: 'live-user-1' },
     message: { type: 'text', id: 'message-test-1', text: orderText },
   }] });
   const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
@@ -409,8 +443,48 @@ test('完整 webhook 流程可接單、寫入 MongoDB 並用 Reply API 回覆', 
     assert.equal(mongoWrite.filter.groupId, 'live-group');
     assert.equal(mongoWrite.filter.date, '9/21');
     assert.equal(mongoWrite.update.$set.loc, '新北市土城區');
+    assert.equal(mongoWrite.update.$set.conversationType, 'group');
+    assert.equal(mongoWrite.update.$set.senderKey.length, 10);
     assert.match(lineReply.url, /message\/reply$/);
     assert.match(lineReply.payload.messages[0].text, /接新北市土城區/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('任意日期的舊式修正指令均會停止且不修改資料', async () => {
+  let databaseWriteCalled = false;
+  bot.__setOrdersCollectionForTests({
+    async updateOne() { databaseWriteCalled = true; },
+    async bulkWrite() { databaseWriteCalled = true; },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'repair-reply',
+    source: { type: 'group', groupId: 'safe-group', userId: 'safe-user' },
+    message: { type: 'text', id: 'repair-message', text: '修正9/10' },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-line-signature': signature },
+      body,
+    });
+    assert.equal(response.status, 200);
+    assert.match(replyText, /指令已停用/);
+    assert.match(replyText, /沒有修改任何資料/);
+    assert.equal(databaseWriteCalled, false);
   } finally {
     axios.post = originalPost;
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));

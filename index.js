@@ -12,6 +12,7 @@ const MONGO_URI = process.env.MONGO_URI?.trim(); // 例如 mongodb+srv://user:pa
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
+const BOT_VERSION = '1.2.0-diagnostic';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -47,7 +48,12 @@ async function connectMongo() {
 if (!IS_TEST_RUNTIME) connectMongo();
 
 // 寫入一筆訂單紀錄到 MongoDB（供月結統計使用）；失敗不影響當天簡表功能
-async function saveOrderToMongo(groupId, date, key, order) {
+function anonymizeId(value) {
+  if (!value) return 'unknown';
+  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 10);
+}
+
+async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
   if (!ordersCollection) return;
   try {
     const canonicalDate = normalizeDate(date);
@@ -61,6 +67,8 @@ async function saveOrderToMongo(groupId, date, key, order) {
         date: canonicalDate,
         serviceYear,
         key,
+        ...(audit.senderId ? { senderKey: anonymizeId(audit.senderId) } : {}),
+        ...(audit.conversationType ? { conversationType: audit.conversationType } : {}),
         cancelled: false,
         updatedAt: new Date(),
       } },
@@ -881,20 +889,33 @@ app.post('/webhook', async (req, res) => {
     const text = rawText.replace(/[\u200B-\u200D\uFEFF\u00A0]/g, (ch) => ch === '\u00A0' ? ' ' : '');
     const sourceId = event.source.groupId || event.source.roomId || event.source.userId;
     if (!sourceId) continue;
+    const auditContext = {
+      senderId: event.source.userId,
+      conversationType: event.source.type || (event.source.groupId ? 'group' : event.source.roomId ? 'room' : 'user'),
+    };
     const releaseSourceQueue = await acquireSourceQueue(sourceId);
     try {
       groupIds[sourceId] = true;
 
     // ── 測試指令：使用 Reply API，不計入每月 Push 訊息額度 ──
     if (text === '測試') {
-      await replyMessage(event.replyToken, 'BOT 測試成功 ✅');
+      await replyMessage(event.replyToken, `BOT 測試成功 ✅\n版本：${BOT_VERSION}`);
       continue;
     }
 
-    // ── 一次性資料修正：安全核對 9/7 的正確 8 趟後，排除其餘誤存紀錄 ──
-    if (text.replace(/\s/g, '') === '修正9/7') {
-      const result = await repairSeptember7(sourceId);
-      await replyMessage(event.replyToken, result);
+    // 只讀診斷：不新增、不取消、不修改任何訂單。
+    if (text.replace(/\s/g, '') === '群組診斷') {
+      const report = await buildGroupDiagnostic(sourceId, auditContext);
+      await replyMessage(event.replyToken, report);
+      continue;
+    }
+
+    // 舊式日期修正指令全面停用。修正前必須先執行當下台灣日期的只讀診斷，
+    // 再由管理者確認實際正確訂單，避免把其他群組或合法訂單誤取消。
+    if (/^修正\s*\d{1,2}\/\d{1,2}$/.test(text)) {
+      await replyMessage(event.replyToken,
+        `安全保護：舊式「${text}」指令已停用，沒有修改任何資料。\n請先輸入「群組診斷」。`
+      );
       continue;
     }
 
@@ -963,7 +984,7 @@ app.post('/webhook', async (req, res) => {
         const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
         orders[key] = o;
         setChanged(sourceId, date);
-        await saveOrderToMongo(sourceId, date, key, o);
+        await saveOrderToMongo(sourceId, date, key, o, auditContext);
       }
       const date = found ? found.date : normalizeDate(newOrders[0]?.date);
       await sendOrScheduleSummary(event.replyToken, sourceId, date);
@@ -1062,7 +1083,7 @@ app.post('/webhook', async (req, res) => {
 
         const key = o.orderId || `${o.time}|${o.price}|${o.loc}`;
         orders[key] = o;
-        await saveOrderToMongo(sourceId, date, key, o);
+        await saveOrderToMongo(sourceId, date, key, o, auditContext);
       }
       const date = normalizeDate(newOrders[0]?.date);
       if (newOrders.length) await sendOrScheduleSummary(event.replyToken, sourceId, date);
@@ -1151,6 +1172,64 @@ function parseMonthCommand(text) {
     return getBusinessDateParts().month; // 台灣時間的當月
   }
   return null;
+}
+
+// 群組隔離診斷：只讀取執行指令的群組與台灣當日資料。
+async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()) {
+  const businessNow = getBusinessDateParts(now);
+  const date = `${businessNow.month}/${businessNow.day}`;
+  const groupCode = anonymizeId(groupId);
+  const senderCode = anonymizeId(auditContext.senderId);
+  const memoryOrders = Object.values(getDateOrders(groupId, date) || {})
+    .filter(order => order && !order.isPlaceholder && !order.isShuttle);
+
+  if (!ordersCollection) {
+    return [
+      '群組診斷（只讀）',
+      `Bot版本：${BOT_VERSION}`,
+      `台灣時間：${date} ${String(businessNow.hour).padStart(2, '0')}:${String(businessNow.minute).padStart(2, '0')}`,
+      `群組代碼：${groupCode}`,
+      `發送者代碼：${senderCode}`,
+      `群組類型：${auditContext.conversationType || 'unknown'}`,
+      `記憶體有效訂單：${memoryOrders.length} 筆`,
+      'MongoDB：未連線（沒有修改任何資料）',
+    ].join('\n');
+  }
+
+  try {
+    const records = await ordersCollection.find({
+      groupId,
+      serviceYear: businessNow.year,
+      date,
+      cancelled: false,
+    }).sort({ time: 1, updatedAt: 1 }).toArray();
+    const validOrders = records.filter(record => typeof record.price === 'number');
+    const total = validOrders.reduce((sum, record) => sum + record.price, 0);
+    const senderKeys = new Set(records.map(record => record.senderKey || '舊資料').filter(Boolean));
+    const orderLines = validOrders.slice(0, 25).map((record, index) => {
+      const location = record.type === '接' ? `接${record.loc || '?'}` : `${record.loc || '?'}送`;
+      return `${index + 1}。${record.time || '時間待確認'}，${location}，${fmtP(record.price)}`;
+    });
+    if (validOrders.length > 25) orderLines.push(`其餘 ${validOrders.length - 25} 筆省略`);
+
+    return [
+      '群組診斷（只讀，未修改資料）',
+      `Bot版本：${BOT_VERSION}`,
+      `台灣時間：${date} ${String(businessNow.hour).padStart(2, '0')}:${String(businessNow.minute).padStart(2, '0')}`,
+      `群組代碼：${groupCode}`,
+      `發送者代碼：${senderCode}`,
+      `群組類型：${auditContext.conversationType || 'unknown'}`,
+      `記憶體有效訂單：${memoryOrders.length} 筆`,
+      `MongoDB有效訂單：${validOrders.length} 筆`,
+      `MongoDB金額：${fmtP(total)}`,
+      `資料內發單者：${senderKeys.size} 種（舊資料可能沒有發送者代碼）`,
+      '今日訂單：',
+      ...(orderLines.length ? orderLines : ['無']),
+    ].join('\n');
+  } catch (err) {
+    console.error('群組診斷失敗:', err.message);
+    return `群組診斷失敗：${date} 的資料無法讀取，沒有修改任何資料。`;
+  }
 }
 
 // 一次性修正 9/7 資料：
@@ -1365,6 +1444,7 @@ app.get('/health', (req, res) => {
   const status = databaseReady ? 200 : 503;
   res.status(status).json({
     status: databaseReady ? 'ok' : 'degraded',
+    version: BOT_VERSION,
     lineConfigured: Boolean(CHANNEL_SECRET && CHANNEL_ACCESS_TOKEN),
     databaseReady,
     testMode: TEST_MODE,
@@ -1455,6 +1535,8 @@ module.exports = {
   saveOrderToMongo,
   markOrderCancelledInMongo,
   buildMonthlyReport,
+  buildGroupDiagnostic,
+  anonymizeId,
   repairSeptember7,
   __setOrdersCollectionForTests(collection) {
     if (!IS_TEST_RUNTIME) throw new Error('僅限測試環境');
