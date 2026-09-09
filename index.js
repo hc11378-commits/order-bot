@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 const { MongoClient } = require('mongodb');
+const { zipSync, strToU8 } = require('fflate');
 
 const app = express();
 
@@ -12,7 +13,7 @@ const MONGO_URI = process.env.MONGO_URI?.trim(); // MongoDB Atlas 連線字串�
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '1.3.3-confirmed-data-repair';
+const BOT_VERSION = '1.4.0-summary-excel';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -878,7 +879,19 @@ function getCustomerCollectionTotal(order) {
   }, 0);
 }
 
-function buildSummary(groupId, date, orders) {
+// 簡表與會計報表只顯示會影響現場作業或金額的標準欄位。
+// 禁煙提醒、LINE ID、姓名、電話及其他自由文字不放進簡表，避免畫面雜亂與個資外露。
+function getOperationalRemarks(order) {
+  const allowed = new Set(['舉牌', '安椅', '增高墊']);
+  return [...new Set((order?.remarks || []).filter(remark => allowed.has(String(remark))))];
+}
+
+function getSummaryLineRemarks(order) {
+  const customerRemarks = (order?.remarks || []).filter(remark => /^客收\s*[\d,]+(?:\.\d+)?$/.test(String(remark)));
+  return [...new Set([...getOperationalRemarks(order), ...customerRemarks])];
+}
+
+function buildSummary(groupId, date, orders, options = {}) {
   const active = Object.values(orders).filter(o => o !== null);
   if (!active.length) return null;
   active.sort((a,b) => toMin(a.time) - toMin(b.time));
@@ -887,17 +900,15 @@ function buildSummary(groupId, date, orders) {
   const otherCount = {};
   active.forEach(o => {
     if (o.isPlaceholder || o.isShuttle) return;
-    o.remarks.forEach(r => {
-      if (!r.startsWith('客收') && ['舉牌','安椅','增高墊'].includes(r)) {
-        otherCount[r] = (otherCount[r]||0) + 1;
-      }
+    getOperationalRemarks(o).forEach(r => {
+      otherCount[r] = (otherCount[r]||0) + 1;
     });
     customerCollectionTotal += getCustomerCollectionTotal(o);
   });
 
   let total = 0;
   let hasUnconfirmed = false;
-  const lines = [date + (hasChanges[groupId]?.[date] ? '（更新）' : '')];
+  const lines = [date + (options.forceUpdated || hasChanges[groupId]?.[date] ? '（更新）' : '')];
   active.forEach((o, i) => {
     // 補單佔位
     if (o.isPlaceholder) {
@@ -918,7 +929,8 @@ function buildSummary(groupId, date, orders) {
     if (!hasSettlementPrice && orderCustomerCollection <= 0) hasUnconfirmed = true;
     else if (hasSettlementPrice) total += o.price;
 
-    const rStr = o.remarks.length ? o.remarks.join('、')+'，' : '';
+    const visibleRemarks = getSummaryLineRemarks(o);
+    const rStr = visibleRemarks.length ? visibleRemarks.join('、')+'，' : '';
 
     let locStr;
     if (o.type === 'transfer') {
@@ -1180,6 +1192,14 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    // 手動簡表：只讀取目前群組，可指定服務日，例如「簡表 9/10」。
+    const summaryMatch = text.match(/^簡表(?:\s*(\d{1,2}\/\d{1,2}))?$/);
+    if (summaryMatch) {
+      const report = await buildRequestedSummary(sourceId, summaryMatch[1] || null, new Date());
+      await replyMessage(event.replyToken, report);
+      continue;
+    }
+
     if (/^修復\s*已確認舊資料$/.test(text)) {
       const report = await repairConfirmedLegacyData(sourceId, auditContext);
       await replyMessage(event.replyToken, report);
@@ -1199,6 +1219,24 @@ app.post('/webhook', async (req, res) => {
       await replyMessage(event.replyToken,
         `安全保護：舊式「${text}」指令已停用，沒有修改任何資料。\n請先輸入「群組診斷」。`
       );
+      continue;
+    }
+
+    // 月結 Excel：回覆一個限時下載連結，點開時才即時產生該群組報表。
+    const excelMonthCmd = parseMonthlyExcelCommand(text);
+    if (excelMonthCmd !== null) {
+      if (excelMonthCmd === -1) {
+        await replyMessage(event.replyToken, '月份無效，請使用例如「月結 9月 Excel」。');
+        continue;
+      }
+      const year = getBusinessDateParts().year;
+      const report = await buildMonthlyReport(sourceId, excelMonthCmd, year);
+      if (/尚無有效訂單|無法使用|發生錯誤/.test(report)) {
+        await replyMessage(event.replyToken, report);
+        continue;
+      }
+      const url = createMonthlyExcelDownloadUrl(sourceId, year, excelMonthCmd);
+      await replyMessage(event.replyToken, `${report}\n\nExcel下載（24小時有效）：\n${url}`);
       continue;
     }
 
@@ -1539,6 +1577,47 @@ function parseMonthCommand(text) {
     return getBusinessDateParts().month; // 台灣時間的當月
   }
   return null;
+}
+
+function parseMonthlyExcelCommand(text) {
+  const match = String(text).trim().match(/^月結\s*(?:(\d{1,2})\s*月?)?\s*(?:excel|xlsx)$/i);
+  if (!match) return null;
+  if (!match[1]) return getBusinessDateParts().month;
+  const month = Number(match[1]);
+  return month >= 1 && month <= 12 ? month : -1;
+}
+
+async function resolveGroupServiceDate(groupId, requestedDate = null, now = new Date()) {
+  const businessNow = getBusinessDateParts(now);
+  let date = requestedDate ? normalizeDate(requestedDate) : normalizeDate(lastActiveDate[groupId]);
+  let serviceYear = businessNow.year;
+  if (requestedDate && !date) return null;
+
+  if (ordersCollection) {
+    try {
+      const filter = { groupId, cancelled: false };
+      if (date) filter.date = date;
+      const latest = await ordersCollection.find(filter).sort({ serviceYear: -1, updatedAt: -1 }).limit(1).toArray();
+      if (latest[0]) {
+        date = normalizeDate(latest[0].date) || date;
+        serviceYear = Number(latest[0].serviceYear) || serviceYear;
+      }
+    } catch (err) {
+      console.error('簡表服務日查詢失敗:', err.message);
+    }
+  }
+
+  return { date: date || `${businessNow.month}/${businessNow.day}`, serviceYear };
+}
+
+async function buildRequestedSummary(groupId, requestedDate = null, now = new Date()) {
+  const resolved = await resolveGroupServiceDate(groupId, requestedDate, now);
+  if (!resolved) {
+    return `簡表停止：「${requestedDate}」不是有效日期。\n請使用例如「簡表 9/10」。`;
+  }
+  const orders = await refreshDateOrdersFromMongo(groupId, resolved.date, resolved.serviceYear);
+  return buildSummary(groupId, resolved.date, orders || {}, { forceUpdated: true }) ||
+    `${resolved.date}（更新）\n目前無有效訂單\n結算價合計：0\n客收合計：0\n業績合計：0`;
 }
 
 // 群組隔離診斷：只讀取執行指令的群組。
@@ -2160,6 +2239,173 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
   return lines.join('\n');
 }
 
+function compareServiceDate(a, b) {
+  const [am, ad] = String(a.date || '').split('/').map(Number);
+  const [bm, bd] = String(b.date || '').split('/').map(Number);
+  return (am * 100 + ad) - (bm * 100 + bd) || toMin(a.time || '00:00') - toMin(b.time || '00:00');
+}
+
+async function loadMonthlyActiveOrders(groupId, month, year) {
+  if (!ordersCollection) return null;
+  const datePattern = new RegExp(`^${month}/\\d{1,2}$`);
+  const records = dedupeOrderRecords(await ordersCollection.find({
+    groupId,
+    serviceYear: year,
+    cancelled: false,
+    date: { $regex: datePattern },
+  }).toArray());
+  return records.filter(record => !record.isPlaceholder && !record.isShuttle).sort(compareServiceDate);
+}
+
+function reportTokenKey() {
+  return crypto.createHash('sha256').update(`monthly-excel|${CHANNEL_SECRET}`).digest();
+}
+
+function createMonthlyExcelToken(groupId, year, month, nowMs = Date.now()) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', reportTokenKey(), iv);
+  const payload = Buffer.from(JSON.stringify({ v: 1, groupId, year, month, exp: nowMs + 24 * 60 * 60 * 1000 }));
+  const encrypted = Buffer.concat([cipher.update(payload), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString('base64url');
+}
+
+function verifyMonthlyExcelToken(token, nowMs = Date.now()) {
+  try {
+    if (typeof token !== 'string' || token.length < 40 || token.length > 2048) return null;
+    const packed = Buffer.from(token, 'base64url');
+    if (packed.length < 29) return null;
+    const decipher = crypto.createDecipheriv('aes-256-gcm', reportTokenKey(), packed.subarray(0, 12));
+    decipher.setAuthTag(packed.subarray(12, 28));
+    const decoded = JSON.parse(Buffer.concat([
+      decipher.update(packed.subarray(28)), decipher.final(),
+    ]).toString('utf8'));
+    if (decoded.v !== 1 || !decoded.groupId || !Number.isInteger(decoded.year) ||
+        decoded.year < 2020 || decoded.year > 2100 || !Number.isInteger(decoded.month) ||
+        decoded.month < 1 || decoded.month > 12 || !Number.isFinite(decoded.exp) || decoded.exp < nowMs) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function createMonthlyExcelDownloadUrl(groupId, year, month) {
+  const baseUrl = (process.env.RENDER_EXTERNAL_URL || 'https://order-bot-45x0.onrender.com').replace(/\/$/, '');
+  return `${baseUrl}/reports/monthly.xlsx?token=${encodeURIComponent(createMonthlyExcelToken(groupId, year, month))}`;
+}
+
+function xmlEscape(value) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+function excelColumnName(index) {
+  let result = '';
+  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) {
+    result = String.fromCharCode(65 + ((n - 1) % 26)) + result;
+  }
+  return result;
+}
+
+function worksheetXml(rows, widths, autoFilterRef = '') {
+  const rowXml = rows.map((row, rowIndex) => {
+    const cells = row.map((cell, columnIndex) => {
+      const model = cell && typeof cell === 'object' && !Array.isArray(cell) && Object.hasOwn(cell, 'value')
+        ? cell : { value: cell };
+      const ref = `${excelColumnName(columnIndex)}${rowIndex + 1}`;
+      const style = model.style ? ` s="${model.style}"` : '';
+      if (typeof model.value === 'number' && Number.isFinite(model.value)) {
+        return `<c r="${ref}"${style}><v>${model.value}</v></c>`;
+      }
+      return `<c r="${ref}" t="inlineStr"${style}><is><t xml:space="preserve">${xmlEscape(model.value)}</t></is></c>`;
+    }).join('');
+    return `<row r="${rowIndex + 1}">${cells}</row>`;
+  }).join('');
+  const cols = widths.map((width, index) =>
+    `<col min="${index + 1}" max="${index + 1}" width="${width}" customWidth="1"/>`).join('');
+  const filter = autoFilterRef ? `<autoFilter ref="${autoFilterRef}"/>` : '';
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+    `<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` +
+    `<cols>${cols}</cols><sheetData>${rowXml}</sheetData>${filter}</worksheet>`;
+}
+
+function styledRow(values, style) {
+  return values.map(value => ({ value, style }));
+}
+
+async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts().year) {
+  const orders = await loadMonthlyActiveOrders(groupId, month, year);
+  if (!orders?.length) return null;
+
+  let settlementTotal = 0;
+  let customerTotal = 0;
+  let pendingCount = 0;
+  const daily = new Map();
+  for (const order of orders) {
+    const settlement = typeof order.price === 'number' ? order.price : 0;
+    const customer = getCustomerCollectionTotal(order);
+    settlementTotal += settlement;
+    customerTotal += customer;
+    if (typeof order.price !== 'number' && customer <= 0) pendingCount++;
+    const stats = daily.get(order.date) || { trips: 0, settlement: 0, customer: 0, pending: 0 };
+    stats.trips++;
+    stats.settlement += settlement;
+    stats.customer += customer;
+    if (typeof order.price !== 'number' && customer <= 0) stats.pending++;
+    daily.set(order.date, stats);
+  }
+
+  const dates = [...daily.keys()].sort((a, b) => compareServiceDate({ date: a }, { date: b }));
+  const performanceTotal = settlementTotal + customerTotal;
+  const summaryRows = [
+    styledRow([`${year}年${month}月結算報表`, ''], 2),
+    ['群組代碼', anonymizeId(groupId)],
+    ['資料涵蓋', `${dates[0]}${dates.length > 1 ? `～${dates.at(-1)}` : ''}`],
+    ['總趟數', orders.length],
+    ['結算價總額', settlementTotal],
+    ['客收總額', customerTotal],
+    ['業績總額', performanceTotal],
+    ['平均每趟業績', Math.round((performanceTotal / orders.length) * 10) / 10],
+    ['待確認金額筆數', pendingCount],
+    [],
+    styledRow(['日期', '趟數', '結算價', '客收', '業績', '待確認筆數'], 1),
+    ...dates.map(date => {
+      const stats = daily.get(date);
+      return [date, stats.trips, stats.settlement, stats.customer, stats.settlement + stats.customer, stats.pending];
+    }),
+  ];
+  const detailRows = [
+    styledRow(['日期', '時間', '接送', '縣市區域', '人數', '訂單編號', '結算價', '客收', '業績', '必要備註'], 1),
+    ...orders.map(order => {
+      const settlement = typeof order.price === 'number' ? order.price : 0;
+      const customer = getCustomerCollectionTotal(order);
+      return [
+        order.date || '', order.time || '', order.type || '', order.loc || '', order.pax ?? '',
+        order.orderId || '', typeof order.price === 'number' ? order.price : '', customer,
+        settlement + customer, getOperationalRemarks(order).join('、'),
+      ];
+    }),
+  ];
+
+  const created = new Date().toISOString();
+  const files = {
+    '[Content_Types].xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>'),
+    '_rels/.rels': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/></Relationships>'),
+    'xl/workbook.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="月結總表" sheetId="1" r:id="rId1"/><sheet name="訂單明細" sheetId="2" r:id="rId2"/></sheets></workbook>'),
+    'xl/_rels/workbook.xml.rels': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'),
+    'xl/styles.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="3"><font><sz val="11"/><name val="Arial"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Arial"/></font><font><b/><sz val="14"/><name val="Arial"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"/><right style="thin"/><top style="thin"/><bottom style="thin"/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>'),
+    'xl/worksheets/sheet1.xml': strToU8(worksheetXml(summaryRows, [22, 22, 16, 16, 16, 16], `A11:F${summaryRows.length}`)),
+    'xl/worksheets/sheet2.xml': strToU8(worksheetXml(detailRows, [12, 10, 10, 24, 10, 18, 14, 14, 14, 18], `A1:J${detailRows.length}`)),
+    'docProps/core.xml': strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${year}年${month}月機場接送月結</dc:title><dc:creator>Airport Transfer Bot</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">${created}</dcterms:created></cp:coreProperties>`),
+    'docProps/app.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Airport Transfer Bot</Application></Properties>'),
+  };
+  return Buffer.from(zipSync(files, { level: 6 }));
+}
+
 app.get('/', (req, res) => res.send('訂單簡表 Bot 運行中 ✅'));
 app.get('/health', (req, res) => {
   const databaseReady = Boolean(ordersCollection);
@@ -2172,6 +2418,27 @@ app.get('/health', (req, res) => {
     testMode: TEST_MODE,
     timeZone: BUSINESS_TIME_ZONE,
   });
+});
+
+app.get('/reports/monthly.xlsx', async (req, res) => {
+  const payload = verifyMonthlyExcelToken(req.query.token);
+  if (!payload) return res.status(403).type('text/plain').send('下載連結無效或已過期，請回到原 LINE 群組重新輸入月結 Excel 指令。');
+  try {
+    const workbook = await buildMonthlyWorkbook(payload.groupId, payload.month, payload.year);
+    if (!workbook) return res.status(404).type('text/plain').send('這個月份目前沒有可匯出的有效訂單。');
+    const filename = `airport-transfer-${payload.year}-${String(payload.month).padStart(2, '0')}.xlsx`;
+    res.set({
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length': String(workbook.length),
+      'Cache-Control': 'private, no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    return res.send(workbook);
+  } catch (err) {
+    console.error('月結 Excel 產生失敗:', err.message);
+    return res.status(500).type('text/plain').send('Excel 產生失敗，請稍後回到 LINE 群組重新操作。');
+  }
 });
 
 // 每天檢查是否為月底最後一天 23:50，自動發送當月月結
@@ -2242,11 +2509,15 @@ module.exports = {
   parseTableOrder,
   toLineMessages,
   buildSummary,
+  buildRequestedSummary,
+  getOperationalRemarks,
+  getSummaryLineRemarks,
   normalizeDate,
   extractServiceYear,
   getBusinessDateParts,
   getTodayStr,
   parseMonthCommand,
+  parseMonthlyExcelCommand,
   verifySignature,
   getDateOrders,
   setChanged,
@@ -2259,6 +2530,10 @@ module.exports = {
   blockOrderReactivation,
   handleLineUnsend,
   buildMonthlyReport,
+  buildMonthlyWorkbook,
+  createMonthlyExcelToken,
+  verifyMonthlyExcelToken,
+  createMonthlyExcelDownloadUrl,
   buildGroupDiagnostic,
   anonymizeId,
   getOrderStorageKey,

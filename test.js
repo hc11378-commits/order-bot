@@ -8,6 +8,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const axios = require('axios');
+const { unzipSync, strFromU8 } = require('fflate');
 const bot = require('./index');
 
 test('全台行政區資料包含 22 縣市及 368 個鄉鎮市區', () => {
@@ -1772,6 +1773,185 @@ test('任意日期的舊式修正指令均會停止且不修改資料', async ()
     assert.equal(databaseWriteCalled, false);
   } finally {
     axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('簡表只顯示必要備註並保留客收金額，隱藏禁煙與 LINE ID', () => {
+  const summary = bot.buildSummary('remark-filter-group', '9/10', {
+    one: {
+      time: '14:15', type: '接', loc: '台北市中山區', pax: 3, price: 763,
+      remarks: ['舉牌', '禁煙', 'LINE: private-id', '安椅', '增高墊', '客收200'],
+    },
+  }, { forceUpdated: true });
+  assert.match(summary, /^9\/10（更新）/);
+  assert.match(summary, /舉牌、安椅、增高墊、客收200/);
+  assert.doesNotMatch(summary, /禁煙|private-id|LINE/);
+  assert.match(summary, /其他備註統計：舉牌\*1、安椅\*1、增高墊\*1/);
+  assert.match(summary, /結算價合計：763/);
+  assert.match(summary, /客收合計：200/);
+  assert.match(summary, /業績合計：963/);
+});
+
+test('月結 Excel 指令支援當月與指定月份並拒絕無效月份', () => {
+  assert.equal(bot.parseMonthlyExcelCommand('月結 Excel') > 0, true);
+  assert.equal(bot.parseMonthlyExcelCommand('月結Excel') > 0, true);
+  assert.equal(bot.parseMonthlyExcelCommand('月結 9月 Excel'), 9);
+  assert.equal(bot.parseMonthlyExcelCommand('月結9xlsx'), 9);
+  assert.equal(bot.parseMonthlyExcelCommand('月結 13月 Excel'), -1);
+  assert.equal(bot.parseMonthlyExcelCommand('月結 9月'), null);
+});
+
+test('月結 Excel 下載憑證會加密群組、限制期限並拒絕竄改', () => {
+  const issuedAt = Date.UTC(2026, 8, 9, 12, 0, 0);
+  const token = bot.createMonthlyExcelToken('private-driver-group', 2026, 9, issuedAt);
+  assert.doesNotMatch(token, /private-driver-group/);
+  assert.deepEqual(bot.verifyMonthlyExcelToken(token, issuedAt + 1000), {
+    v: 1, groupId: 'private-driver-group', year: 2026, month: 9,
+    exp: issuedAt + 24 * 60 * 60 * 1000,
+  });
+  const changed = `${token.slice(0, -1)}${token.endsWith('A') ? 'B' : 'A'}`;
+  assert.equal(bot.verifyMonthlyExcelToken(changed, issuedAt + 1000), null);
+  assert.equal(bot.verifyMonthlyExcelToken(token, issuedAt + 24 * 60 * 60 * 1000 + 1), null);
+});
+
+test('月結 Excel 只匯出目前群組，總表與明細金額一致且不含非必要備註', async () => {
+  const records = [
+    { groupId: 'excel-group', serviceYear: 2026, date: '9/9', key: 'A1', orderId: 'A1', time: '03:00', type: '送', loc: '新北市三重區', pax: 1, price: 645, remarks: ['禁煙', 'LINE: hidden'], cancelled: false },
+    { groupId: 'excel-group', serviceYear: 2026, date: '9/10', key: 'A2', orderId: 'A2', time: '14:15', type: '接', loc: '台北市中山區', pax: 3, price: 763, remarks: ['舉牌', '客收200'], cancelled: false },
+    { groupId: 'other-group', serviceYear: 2026, date: '9/10', key: 'B1', orderId: 'B1', time: '01:00', type: '接', loc: '台北市萬華區', pax: 1, price: 9999, remarks: [], cancelled: false },
+    { groupId: 'excel-group', serviceYear: 2026, date: '9/10', key: 'A3', orderId: 'A3', time: '18:00', type: '送', loc: '新北市板橋區', pax: 1, price: 500, remarks: [], cancelled: true },
+  ];
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        record.serviceYear === query.serviceYear && record.cancelled === query.cancelled &&
+        query.date.$regex.test(record.date));
+      return { async toArray() { return matched; } };
+    },
+  });
+  const workbook = await bot.buildMonthlyWorkbook('excel-group', 9, 2026);
+  assert.ok(Buffer.isBuffer(workbook));
+  assert.ok(workbook.length > 1000);
+  const files = unzipSync(new Uint8Array(workbook));
+  const summaryXml = strFromU8(files['xl/worksheets/sheet1.xml']);
+  const detailXml = strFromU8(files['xl/worksheets/sheet2.xml']);
+  assert.match(summaryXml, /總趟數/);
+  assert.match(summaryXml, /業績總額/);
+  assert.match(detailXml, /新北市三重區/);
+  assert.match(detailXml, /台北市中山區/);
+  assert.match(detailXml, /舉牌/);
+  assert.doesNotMatch(detailXml, /9999|禁煙|hidden|LINE/);
+  assert.match(detailXml, /<v>645<\/v>/);
+  assert.match(detailXml, /<v>763<\/v>/);
+  assert.match(detailXml, /<v>200<\/v>/);
+});
+
+test('「簡表 日期」會從 MongoDB 讀取該群組並立即回覆指定格式', async () => {
+  const records = [
+    { groupId: 'manual-summary-group', serviceYear: 2026, date: '9/10', key: 'S1', time: '03:00', type: '送', loc: '新北市三重區', pax: 1, price: 645, remarks: ['禁煙'], cancelled: false },
+  ];
+  const captured = [];
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      captured.push(query);
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        record.date === (query.date || record.date) && record.cancelled === false);
+      return {
+        sort() { return this; }, limit() { return this; }, async toArray() { return matched; },
+      };
+    },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'summary-reply',
+    source: { type: 'group', groupId: 'manual-summary-group', userId: 'driver' },
+    message: { type: 'text', id: 'summary-message', text: '簡表 9/10' },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+    assert.equal(response.status, 200);
+    assert.ok(captured.every(query => query.groupId === 'manual-summary-group'));
+    assert.match(replyText, /^9\/10（更新）/);
+    assert.match(replyText, /1。03:00，新北市三重區送，1人，645/);
+    assert.doesNotMatch(replyText, /禁煙/);
+    assert.match(replyText, /結算價合計：645/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('LINE 月結 Excel 指令產生可點擊下載連結，端點回傳有效且僅限該群組的 xlsx', async () => {
+  const records = [
+    { groupId: 'download-group', serviceYear: 2026, date: '9/10', key: 'D1', orderId: 'D1', time: '08:00', type: '接', loc: '台北市中山區', pax: 2, price: 700, remarks: ['舉牌'], cancelled: false },
+    { groupId: 'other-download-group', serviceYear: 2026, date: '9/10', key: 'D2', orderId: 'D2', time: '09:00', type: '送', loc: '新北市板橋區', pax: 1, price: 9000, remarks: [], cancelled: false },
+  ];
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        record.serviceYear === query.serviceYear && record.cancelled === query.cancelled &&
+        query.date.$regex.test(record.date));
+      return { async toArray() { return matched; } };
+    },
+  });
+  const originalPost = axios.post;
+  const originalUrl = process.env.RENDER_EXTERNAL_URL;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  process.env.RENDER_EXTERNAL_URL = `http://127.0.0.1:${port}`;
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'excel-reply',
+    source: { type: 'group', groupId: 'download-group', userId: 'accountant' },
+    message: { type: 'text', id: 'excel-message', text: '月結 9月 Excel' },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const webhookResponse = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+    assert.equal(webhookResponse.status, 200);
+    const url = replyText.match(/https?:\/\/[^\s]+\/reports\/monthly\.xlsx\?token=[^\s]+/)?.[0];
+    assert.ok(url);
+    assert.match(replyText, /Excel下載（24小時有效）/);
+    const token = new URL(url).searchParams.get('token');
+    assert.equal(bot.verifyMonthlyExcelToken(token).groupId, 'download-group');
+
+    const downloadResponse = await fetch(url);
+    assert.equal(downloadResponse.status, 200);
+    assert.match(downloadResponse.headers.get('content-type'), /spreadsheetml/);
+    assert.match(downloadResponse.headers.get('content-disposition'), /airport-transfer-2026-09\.xlsx/);
+    const workbook = new Uint8Array(await downloadResponse.arrayBuffer());
+    const files = unzipSync(workbook);
+    const detailXml = strFromU8(files['xl/worksheets/sheet2.xml']);
+    assert.match(detailXml, /台北市中山區/);
+    assert.doesNotMatch(detailXml, /9000|新北市板橋區/);
+
+    const denied = await fetch(`http://127.0.0.1:${port}/reports/monthly.xlsx?token=invalid`);
+    assert.equal(denied.status, 403);
+  } finally {
+    axios.post = originalPost;
+    if (originalUrl === undefined) delete process.env.RENDER_EXTERNAL_URL;
+    else process.env.RENDER_EXTERNAL_URL = originalUrl;
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
   }
 });
