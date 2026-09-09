@@ -12,7 +12,7 @@ const MONGO_URI = process.env.MONGO_URI?.trim(); // MongoDB Atlas 連線字串�
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '1.3.1-withdrawal-lock';
+const BOT_VERSION = '1.3.3-confirmed-data-repair';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -60,6 +60,41 @@ function getOrderStorageKey(order, messageId = '', index = 0) {
   // 但兩筆時間、金額、地點完全相同的合法訂單不會互相覆蓋。
   if (messageId) return `line:${messageId}:${index}`;
   return `legacy:${order.time}|${order.price ?? '?'}|${order.loc || '?'}|${index}`;
+}
+
+// 無訂單編號時，優先用匿名顧客識別碼找出同一群組內的舊紀錄。
+// 這讓客服重貼同一張訂單時更新原紀錄，而不是因 LINE 訊息 ID 不同而多算一趟。
+async function resolveOrderStorageKey(groupId, date, order, messageId = '', index = 0) {
+  const fallbackKey = getOrderStorageKey(order, messageId, index);
+  if (order.orderId || !order.customerKey || !ordersCollection?.find) return fallbackKey;
+  try {
+    const serviceYear = extractServiceYear(order.date);
+    const records = await ordersCollection.find({
+      groupId,
+      serviceYear,
+      date: normalizeDate(date),
+      cancelled: false,
+    }).sort({ updatedAt: -1 }).toArray();
+    const candidates = records.filter(record => !record.orderId && record.key);
+    const exactIdentity = candidates.filter(record => record.customerKey === order.customerKey &&
+      record.time === order.time && record.type === order.type && record.loc === order.loc);
+    if (exactIdentity.length === 1) return exactIdentity[0].key;
+
+    // 舊版本沒有 customerKey；只在唯一一筆且價格特徵吻合時接續原 key。
+    const incomingCustomer = getCustomerCollectionTotal(order);
+    const legacyMatches = candidates.filter(record => {
+      if (record.customerKey) return false;
+      if (record.time !== order.time || record.type !== order.type || record.loc !== order.loc) return false;
+      const recordCustomer = getCustomerCollectionTotal(record);
+      if (incomingCustomer > 0) return recordCustomer === incomingCustomer;
+      return typeof order.price === 'number' && Number(record.price) === order.price && recordCustomer === 0;
+    });
+    if (legacyMatches.length === 1) return legacyMatches[0].key;
+    return fallbackKey;
+  } catch (err) {
+    console.error('MongoDB 無編號訂單防重查詢失敗:', err.message);
+    return fallbackKey;
+  }
 }
 
 function dedupeOrderRecords(records) {
@@ -626,6 +661,24 @@ function detectRemarks(block) {
   return found;
 }
 
+// 僅保存不可逆雜湊，不保存顧客電話。日期＋接送方向＋聯絡電話可在時間或備註
+// 被修改後仍辨認為同一張無編號訂單，同時降低合法相似行程互相覆蓋的風險。
+function extractCustomerKey(block, date, type) {
+  const contactIndex = block.search(/聯絡人[：:]/);
+  if (contactIndex < 0) return null;
+  const contactSection = block.slice(contactIndex);
+  const phoneMatch = contactSection.match(/(?:^|\n)\s*(?:電話|手機)[：:]\s*([^\r\n]+)/);
+  if (!phoneMatch) return null;
+  let digits = phoneMatch[1].replace(/\D/g, '');
+  // 台灣手機可能寫成 09xx、8869xx 或 886-09xx，統一後才不會因格式不同失去防重效果。
+  if (digits.startsWith('8860')) digits = digits.slice(3);
+  else if (digits.startsWith('886')) digits = `0${digits.slice(3)}`;
+  if (digits.length < 8) return null;
+  const canonicalDate = normalizeDate(date);
+  if (!canonicalDate) return null;
+  return anonymizeId(`${canonicalDate}|${type}|${digits}`);
+}
+
 // ════════════════════════════════════════
 // 外車格式二：S99交通趟（非機場，兩地之間）
 // ════════════════════════════════════════
@@ -809,7 +862,8 @@ function parseOrders(text) {
     const loc  = extractLocation(b, type);
     const remarks = detectRemarks(b);
     const date = extractDate(b);
-    results.push({ orderId, time, pax, price, loc, type, remarks, date });
+    const customerKey = extractCustomerKey(b, date, type);
+    results.push({ orderId, time, pax, price, loc, type, remarks, date, customerKey });
   });
   return results;
 }
@@ -1126,6 +1180,19 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    if (/^修復\s*已確認舊資料$/.test(text)) {
+      const report = await repairConfirmedLegacyData(sourceId, auditContext);
+      await replyMessage(event.replyToken, report);
+      continue;
+    }
+
+    // 僅處理已核對過的 9/11 舊資料；完整結果會在同一則回覆中再次驗證。
+    if (/^修復\s*9\/11\s*自客單$/.test(text)) {
+      const report = await repairLegacySeptember11(sourceId, auditContext);
+      await replyMessage(event.replyToken, report);
+      continue;
+    }
+
     // 舊式日期修正指令全面停用。修正前必須先執行當下台灣日期的只讀診斷，
     // 再由管理者確認實際正確訂單，避免把其他群組或合法訂單誤取消。
     if (/^修正\s*\d{1,2}\/\d{1,2}$/.test(text)) {
@@ -1235,7 +1302,7 @@ app.post('/webhook', async (req, res) => {
       for (const [orderIndex, o] of newOrders.entries()) {
         const date = normalizeDate(o.date);
         o.lineMessageId = String(event.message.id);
-        const key = getOrderStorageKey(o, event.message.id, orderIndex);
+        const key = await resolveOrderStorageKey(sourceId, date, o, event.message.id, orderIndex);
         const saved = await saveOrderToMongo(sourceId, date, key, o, auditContext);
         if (saved === 'suppressed') suppressedOrders.push(key);
         else if (!saved) writeFailed = true;
@@ -1358,7 +1425,7 @@ app.post('/webhook', async (req, res) => {
         const date = normalizeDate(o.date);
         lastActiveDate[sourceId] = date; // 記錄最近使用的日期
         o.lineMessageId = String(event.message.id);
-        const key = getOrderStorageKey(o, event.message.id, orderIndex);
+        const key = await resolveOrderStorageKey(sourceId, date, o, event.message.id, orderIndex);
         const saved = await saveOrderToMongo(sourceId, date, key, o, auditContext);
         if (saved === 'suppressed') suppressedOrders.push(key);
         else if (!saved) writeFailed = true;
@@ -1572,6 +1639,302 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
   } catch (err) {
     console.error('群組診斷失敗:', err.message);
     return `群組診斷失敗：${date} 的資料無法讀取，沒有修改任何資料。`;
+  }
+}
+
+// 一次性修復：使用 9/9 19:46 的只讀診斷作為執行前快照。
+// 僅允許指定群組，且筆數與金額完全吻合時才以交易方式交換兩筆資料：
+// 排除 9/11 04:50 中和送 978，補入 04:20 中和送、客收 900。
+async function repairLegacySeptember11(groupId, auditContext = {}) {
+  if (!TEST_MODE) {
+    return '安全保護：只有 TEST_MODE=true 時才能執行「修復9/11自客單」。';
+  }
+  if (!ordersCollection) {
+    return '修復停止：資料庫目前未連線，沒有變更任何資料。';
+  }
+  const allowedGroupCode = process.env.LEGACY_REPAIR_GROUP_CODE?.trim() || '443fcf867b';
+  if (anonymizeId(groupId) !== allowedGroupCode) {
+    return '修復停止：這個指令只適用於已核對的指定群組，沒有變更任何資料。';
+  }
+
+  const serviceYear = 2026;
+  const date = '9/11';
+  const repairKey = 'manual-repair:2026-09-11:04-20:self-customer';
+  const isWithdrawnTarget = record =>
+    record.time === '04:50' && record.type === '送' &&
+    record.loc === '新北市中和區' && Number(record.price) === 978;
+
+  try {
+    const before = dedupeOrderRecords(await ordersCollection.find({
+      groupId, serviceYear, date, cancelled: false,
+    }).sort({ time: 1, updatedAt: 1 }).toArray());
+    const existingRepair = before.filter(record => record.key === repairKey);
+    const activeTargets = before.filter(isWithdrawnTarget);
+    const beforeSettlement = before.reduce(
+      (sum, record) => sum + (typeof record.price === 'number' ? record.price : 0), 0
+    );
+    const beforeCustomer = before.reduce(
+      (sum, record) => sum + getCustomerCollectionTotal(record), 0
+    );
+
+    // 可安全重複輸入：完成後只回報結果，不再寫入第二次。
+    if (existingRepair.length === 1 && activeTargets.length === 0) {
+      const report = await buildGroupDiagnostic(groupId, auditContext, new Date(), date);
+      return `9/11 舊資料已修復，沒有重複修改。\n\n${report}`;
+    }
+
+    const snapshotMatches = before.length === 7 && beforeSettlement === 5451 &&
+      beforeCustomer === 0 && existingRepair.length === 0 && activeTargets.length === 1;
+    if (!snapshotMatches) {
+      return [
+        '修復停止：目前資料已和 9/9 19:46 的核對快照不同，因此沒有變更任何資料。',
+        `目前有效訂單：${before.length} 筆`,
+        `目前結算價：${fmtP(beforeSettlement)}`,
+        `目前客收：${fmtP(beforeCustomer)}`,
+        `符合「04:50、中和送、978」：${activeTargets.length} 筆`,
+        `既有自客補單：${existingRepair.length} 筆`,
+      ].join('\n');
+    }
+
+    const repairedAt = new Date();
+    const target = activeTargets[0];
+    const operations = [
+      {
+        updateOne: {
+          filter: { _id: target._id, groupId, cancelled: false },
+          update: { $set: {
+            cancelled: true,
+            preventReactivation: true,
+            cancellationReason: '9/11舊資料修復：LINE舊訊息已收回',
+            repairedAt,
+            updatedAt: repairedAt,
+          } },
+        },
+      },
+      {
+        updateOne: {
+          filter: { groupId, serviceYear, date, key: repairKey },
+          update: { $set: {
+            groupId,
+            serviceYear,
+            date,
+            key: repairKey,
+            orderId: null,
+            time: '04:20',
+            type: '送',
+            loc: '新北市中和區',
+            pax: 2,
+            price: null,
+            remarks: ['客收900'],
+            cancelled: false,
+            manualRepair: true,
+            correctionReason: '補入部署前漏接的9/11自客單',
+            ...(auditContext.senderId ? { senderKey: anonymizeId(auditContext.senderId) } : {}),
+            ...(auditContext.conversationType ? { conversationType: auditContext.conversationType } : {}),
+            repairedAt,
+            updatedAt: repairedAt,
+          } },
+          upsert: true,
+        },
+      },
+    ];
+
+    const session = mongoClient?.startSession ? mongoClient.startSession() : null;
+    if (session) {
+      try {
+        await session.withTransaction(async () => {
+          await ordersCollection.bulkWrite(operations, { ordered: true, session });
+        });
+      } finally {
+        await session.endSession();
+      }
+    } else {
+      await ordersCollection.bulkWrite(operations, { ordered: true });
+    }
+
+    const after = dedupeOrderRecords(await ordersCollection.find({
+      groupId, serviceYear, date, cancelled: false,
+    }).sort({ time: 1, updatedAt: 1 }).toArray());
+    const afterSettlement = after.reduce(
+      (sum, record) => sum + (typeof record.price === 'number' ? record.price : 0), 0
+    );
+    const afterCustomer = after.reduce(
+      (sum, record) => sum + getCustomerCollectionTotal(record), 0
+    );
+    const verified = after.length === 7 && afterSettlement === 4473 && afterCustomer === 900 &&
+      after.filter(record => record.key === repairKey).length === 1 &&
+      after.filter(isWithdrawnTarget).length === 0;
+    if (!verified) {
+      console.error('9/11 舊資料修復後驗證未通過');
+      return '修復後驗證未通過：請勿繼續操作，請查看 Render Logs。';
+    }
+
+    // 清除本機舊快取，確保接著產生的診斷一定重新反映 MongoDB。
+    if (dailyOrders[groupId]) delete dailyOrders[groupId][date];
+    const report = await buildGroupDiagnostic(groupId, auditContext, new Date(), date);
+    return `9/11 舊資料修復完成 ✅\n已排除：04:50，新北市中和區送，978\n已補入：04:20，新北市中和區送，客收900\n\n${report}`;
+  } catch (err) {
+    console.error('9/11 舊資料修復失敗:', err.message);
+    return '修復失敗：資料庫操作發生錯誤，沒有確認完成；請查看 Render Logs。';
+  }
+}
+
+// 將已由使用者逐筆核對的 9/9 與 9/11 舊資料一次完成修復。
+// 兩天都必須符合「修復前」或「已修復」狀態；任何一日出現第三種狀態便整批停止。
+async function repairConfirmedLegacyData(groupId, auditContext = {}) {
+  if (!TEST_MODE) {
+    return '安全保護：只有 TEST_MODE=true 時才能執行「修復已確認舊資料」。';
+  }
+  if (!ordersCollection) {
+    return '修復停止：資料庫目前未連線，沒有變更任何資料。';
+  }
+  const allowedGroupCode = process.env.LEGACY_REPAIR_GROUP_CODE?.trim() || '443fcf867b';
+  if (anonymizeId(groupId) !== allowedGroupCode) {
+    return '修復停止：這個指令只適用於已核對的指定群組，沒有變更任何資料。';
+  }
+
+  const repairKey = 'manual-repair:2026-09-11:04-20:self-customer';
+  const loadDay = async date => dedupeOrderRecords(await ordersCollection.find({
+    groupId, serviceYear: 2026, date, cancelled: false,
+  }).sort({ time: 1, updatedAt: 1 }).toArray());
+  const totals = records => ({
+    count: records.length,
+    settlement: records.reduce(
+      (sum, record) => sum + (typeof record.price === 'number' ? record.price : 0), 0
+    ),
+    customer: records.reduce((sum, record) => sum + getCustomerCollectionTotal(record), 0),
+  });
+  const isSeptember9OldDuplicate = record =>
+    record.time === '05:00' && record.type === '送' && record.loc === '新北市新店區' &&
+    typeof record.price !== 'number' && getCustomerCollectionTotal(record) === 1100;
+  const isSeptember9KeptOrder = record =>
+    record.time === '05:00' && record.type === '送' && record.loc === '新北市新店區' &&
+    Number(record.price) === 1100 && getCustomerCollectionTotal(record) === 1100;
+  const isSeptember11Withdrawn = record =>
+    record.time === '04:50' && record.type === '送' &&
+    record.loc === '新北市中和區' && Number(record.price) === 978;
+
+  try {
+    const [day9, day11] = await Promise.all([loadDay('9/9'), loadDay('9/11')]);
+    const total9 = totals(day9);
+    const total11 = totals(day11);
+    const old9 = day9.filter(isSeptember9OldDuplicate);
+    const kept9 = day9.filter(isSeptember9KeptOrder);
+    const withdrawn11 = day11.filter(isSeptember11Withdrawn);
+    const repaired11 = day11.filter(record => record.key === repairKey);
+
+    const day9Before = total9.count === 9 && total9.settlement === 5933 && total9.customer === 2200 &&
+      old9.length === 1 && kept9.length === 1;
+    const day9After = total9.count === 8 && total9.settlement === 5933 && total9.customer === 1100 &&
+      old9.length === 0 && kept9.length === 1;
+    const day11Before = total11.count === 7 && total11.settlement === 5451 && total11.customer === 0 &&
+      withdrawn11.length === 1 && repaired11.length === 0;
+    const day11After = total11.count === 7 && total11.settlement === 4473 && total11.customer === 900 &&
+      withdrawn11.length === 0 && repaired11.length === 1;
+
+    if ((!day9Before && !day9After) || (!day11Before && !day11After)) {
+      return [
+        '修復停止：目前資料與兩份已確認診斷不一致，沒有變更任何資料。',
+        `9/9：${total9.count}筆，結算價${fmtP(total9.settlement)}，客收${fmtP(total9.customer)}`,
+        `9/11：${total11.count}筆，結算價${fmtP(total11.settlement)}，客收${fmtP(total11.customer)}`,
+      ].join('\n');
+    }
+
+    const repairedAt = new Date();
+    const operations = [];
+    if (day9Before) {
+      operations.push({ updateOne: {
+        filter: { _id: old9[0]._id, groupId, cancelled: false },
+        update: { $set: {
+          cancelled: true,
+          preventReactivation: true,
+          cancellationReason: '9/9舊資料修復：排除收回後重貼造成的重複單',
+          repairedAt,
+          updatedAt: repairedAt,
+        } },
+      } });
+    }
+    if (day11Before) {
+      operations.push(
+        { updateOne: {
+          filter: { _id: withdrawn11[0]._id, groupId, cancelled: false },
+          update: { $set: {
+            cancelled: true,
+            preventReactivation: true,
+            cancellationReason: '9/11舊資料修復：LINE舊訊息已收回',
+            repairedAt,
+            updatedAt: repairedAt,
+          } },
+        } },
+        { updateOne: {
+          filter: { groupId, serviceYear: 2026, date: '9/11', key: repairKey },
+          update: { $set: {
+            groupId,
+            serviceYear: 2026,
+            date: '9/11',
+            key: repairKey,
+            orderId: null,
+            time: '04:20',
+            type: '送',
+            loc: '新北市中和區',
+            pax: 2,
+            price: null,
+            remarks: ['客收900'],
+            cancelled: false,
+            manualRepair: true,
+            correctionReason: '補入部署前漏接的9/11自客單',
+            ...(auditContext.senderId ? { senderKey: anonymizeId(auditContext.senderId) } : {}),
+            ...(auditContext.conversationType ? { conversationType: auditContext.conversationType } : {}),
+            repairedAt,
+            updatedAt: repairedAt,
+          } },
+          upsert: true,
+        } }
+      );
+    }
+
+    if (operations.length) {
+      const session = mongoClient?.startSession ? mongoClient.startSession() : null;
+      if (session) {
+        try {
+          await session.withTransaction(async () => {
+            await ordersCollection.bulkWrite(operations, { ordered: true, session });
+          });
+        } finally {
+          await session.endSession();
+        }
+      } else {
+        await ordersCollection.bulkWrite(operations, { ordered: true });
+      }
+    }
+
+    const [verified9, verified11] = await Promise.all([loadDay('9/9'), loadDay('9/11')]);
+    const verifiedTotal9 = totals(verified9);
+    const verifiedTotal11 = totals(verified11);
+    const verified = verifiedTotal9.count === 8 && verifiedTotal9.settlement === 5933 &&
+      verifiedTotal9.customer === 1100 && verified9.filter(isSeptember9OldDuplicate).length === 0 &&
+      verified9.filter(isSeptember9KeptOrder).length === 1 &&
+      verifiedTotal11.count === 7 && verifiedTotal11.settlement === 4473 &&
+      verifiedTotal11.customer === 900 && verified11.filter(isSeptember11Withdrawn).length === 0 &&
+      verified11.filter(record => record.key === repairKey).length === 1;
+    if (!verified) {
+      console.error('已確認舊資料修復後驗證未通過');
+      return '修復後驗證未通過：請勿繼續操作，請查看 Render Logs。';
+    }
+
+    if (dailyOrders[groupId]) {
+      delete dailyOrders[groupId]['9/9'];
+      delete dailyOrders[groupId]['9/11'];
+    }
+    const [report9, report11] = await Promise.all([
+      buildGroupDiagnostic(groupId, auditContext, new Date(), '9/9'),
+      buildGroupDiagnostic(groupId, auditContext, new Date(), '9/11'),
+    ]);
+    const status = operations.length ? '已確認舊資料修復完成 ✅' : '已確認舊資料先前已修復，沒有重複修改。';
+    return [status, '', '【9/9 驗證】', report9, '', '【9/11 驗證】', report11].join('\n');
+  } catch (err) {
+    console.error('已確認舊資料修復失敗:', err.message);
+    return '修復失敗：資料庫操作發生錯誤，沒有確認完成；請查看 Render Logs。';
   }
 }
 
@@ -1899,7 +2262,11 @@ module.exports = {
   buildGroupDiagnostic,
   anonymizeId,
   getOrderStorageKey,
+  resolveOrderStorageKey,
+  extractCustomerKey,
   dedupeOrderRecords,
+  repairConfirmedLegacyData,
+  repairLegacySeptember11,
   repairSeptember7,
   __setOrdersCollectionForTests(collection) {
     if (!IS_TEST_RUNTIME) throw new Error('僅限測試環境');

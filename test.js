@@ -165,6 +165,12 @@ test('無接送標題的自客單與「客收：900」可正確辨識為900業�
     date: '9/11', time: '04:20', type: '送', loc: '新北市中和區',
     pax: 2, price: null, remarks: ['客收900'],
   });
+  assert.equal(orders[0].customerKey.length, 10);
+  assert.doesNotMatch(orders[0].customerKey, /0900000000/);
+  const [countryCodeOrder] = bot.parseOrders(text.replace(
+    '電話：0900000000', '電話：+886-900-000-000'
+  ));
+  assert.equal(countryCodeOrder.customerKey, orders[0].customerKey);
   const summary = bot.buildSummary('self-customer-group', '9/11', { self: orders[0] });
   assert.match(summary, /結算價合計：0/);
   assert.match(summary, /客收合計：900/);
@@ -699,6 +705,256 @@ test('匿名識別碼固定且不同群組不會相同', () => {
   assert.equal(bot.anonymizeId('group-A').length, 10);
 });
 
+test('單一 LINE 指令以同一流程修復已確認的 9/9 重複單與 9/11 漏單', async () => {
+  const groupId = 'combined-legacy-repair-group';
+  const makeRecord = (date, row) => ({
+    _id: date.replace('/', '-') + '-' + row[0],
+    groupId, serviceYear: 2026, date, key: date + '-' + row[0], orderId: row[0],
+    time: row[1], type: row[2], loc: row[3], pax: 1,
+    price: row[4], remarks: row[5] || [], cancelled: false,
+    updatedAt: new Date('2026-09-09T10:00:00.000Z'),
+  });
+  const records = [
+    ['a1','00:00','接','台北松山',758,[]],
+    ['a2','02:00','接','台北中正',858,[]],
+    ['a3','05:00','送','新北市新店區',null,['客收1100']],
+    ['a4','05:00','送','新北市新店區',1100,['客收1100']],
+    ['a5','05:45','接','台北松山',630,[]],
+    ['a6','10:00','接','台北中正',648,[]],
+    ['a7','13:00','送','台北信義',638,[]],
+    ['a8','13:25','接','新北中和',691,[]],
+    ['a9','16:30','送','台北萬華',610,[]],
+  ].map(row => makeRecord('9/9', row));
+  records.push(...[
+    ['b1','00:10','接','台北市中正區',1013,[]],
+    ['b2','03:00','送','新北市永和區',690,[]],
+    ['b3','04:50','送','新北市中和區',978,[]],
+    ['b4','05:45','接','新北市三重區',685,[]],
+    ['b5','09:00','送','台北市士林區',700,[]],
+    ['b6','09:00','接','台北市萬華區',740,[]],
+    ['b7','11:45','送','台北市中正區',645,[]],
+  ].map(row => makeRecord('9/11', row)));
+
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      const matched = records.filter(record =>
+        (!('groupId' in query) || record.groupId === query.groupId) &&
+        (!('serviceYear' in query) || record.serviceYear === query.serviceYear) &&
+        (!('date' in query) || (query.date?.$regex instanceof RegExp
+          ? query.date.$regex.test(record.date)
+          : record.date === query.date)) &&
+        (!('cancelled' in query) || record.cancelled === query.cancelled));
+      return { sort() { return this; }, async toArray() { return matched; } };
+    },
+    async bulkWrite(operations) {
+      for (const operation of operations) {
+        const { filter, update, upsert } = operation.updateOne;
+        const index = records.findIndex(record =>
+          (!('_id' in filter) || record._id === filter._id) &&
+          (!('groupId' in filter) || record.groupId === filter.groupId) &&
+          (!('serviceYear' in filter) || record.serviceYear === filter.serviceYear) &&
+          (!('date' in filter) || record.date === filter.date) &&
+          (!('key' in filter) || record.key === filter.key) &&
+          (!('cancelled' in filter) || record.cancelled === filter.cancelled));
+        if (index >= 0) records[index] = { ...records[index], ...update.$set };
+        else if (upsert) records.push({ ...filter, ...update.$set, _id: 'combined-repair-added' });
+      }
+    },
+  });
+  const previousAllowedCode = process.env.LEGACY_REPAIR_GROUP_CODE;
+  process.env.LEGACY_REPAIR_GROUP_CODE = bot.anonymizeId(groupId);
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const sendCommand = async messageId => {
+    const body = JSON.stringify({ events: [{
+      type: 'message', replyToken: 'combined-repair-reply-' + messageId,
+      source: { type: 'group', groupId, userId: 'verified-user' },
+      message: { type: 'text', id: messageId, text: '修復已確認舊資料' },
+    }] });
+    const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+      .update(Buffer.from(body)).digest('base64');
+    return fetch('http://127.0.0.1:' + port + '/webhook', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+  };
+  try {
+    let response = await sendCommand('combined-repair-first');
+    assert.equal(response.status, 200);
+    assert.match(replyText, /已確認舊資料修復完成/);
+    assert.match(replyText, /【9\/9 驗證】[\s\S]*MongoDB有效訂單：8 筆/);
+    assert.match(replyText, /【9\/9 驗證】[\s\S]*結算價總額：5933/);
+    assert.match(replyText, /【9\/9 驗證】[\s\S]*客收總額：1100/);
+    assert.match(replyText, /【9\/9 驗證】[\s\S]*業績總額：7033/);
+    assert.match(replyText, /【9\/11 驗證】[\s\S]*MongoDB有效訂單：7 筆/);
+    assert.match(replyText, /【9\/11 驗證】[\s\S]*結算價總額：4473/);
+    assert.match(replyText, /【9\/11 驗證】[\s\S]*客收總額：900/);
+    assert.match(replyText, /【9\/11 驗證】[\s\S]*業績總額：5373/);
+    assert.equal(records.filter(record => record.date === '9/9' && !record.cancelled).length, 8);
+    assert.equal(records.filter(record => record.date === '9/11' && !record.cancelled).length, 7);
+
+    response = await sendCommand('combined-repair-second');
+    assert.equal(response.status, 200);
+    assert.match(replyText, /先前已修復，沒有重複修改/);
+    assert.equal(records.filter(record => record.date === '9/9' && !record.cancelled).length, 8);
+    assert.equal(records.filter(record => record.date === '9/11' && !record.cancelled).length, 7);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    if (previousAllowedCode === undefined) delete process.env.LEGACY_REPAIR_GROUP_CODE;
+    else process.env.LEGACY_REPAIR_GROUP_CODE = previousAllowedCode;
+  }
+});
+
+test('9/11 舊資料修復精準交換收回單與自客單，重跑不重複且結果符合核對值', async () => {
+  const groupId = 'verified-legacy-repair-group';
+  const records = [
+    ['r1','00:10','接','台北市中正區',1013,[]],
+    ['r2','03:00','送','新北市永和區',690,['LINE: test1']],
+    ['r3','04:50','送','新北市中和區',978,[]],
+    ['r4','05:45','接','新北市三重區',685,['LINE: test2']],
+    ['r5','09:00','送','台北市士林區',700,[]],
+    ['r6','09:00','接','台北市萬華區',740,['舉牌']],
+    ['r7','11:45','送','台北市中正區',645,[]],
+  ].map(row => ({
+    _id: row[0], groupId, serviceYear: 2026, date: '9/11',
+    key: row[0], orderId: row[0], time: row[1], type: row[2], loc: row[3],
+    pax: 1, price: row[4], remarks: row[5], cancelled: false,
+    updatedAt: new Date('2026-09-09T10:00:00.000Z'),
+  }));
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      const matched = records.filter(record =>
+        (!('groupId' in query) || record.groupId === query.groupId) &&
+        (!('serviceYear' in query) || record.serviceYear === query.serviceYear) &&
+        (!('date' in query) || (query.date instanceof RegExp
+          ? query.date.test(record.date)
+          : query.date?.$regex instanceof RegExp
+            ? query.date.$regex.test(record.date)
+            : record.date === query.date)) &&
+        (!('cancelled' in query) || record.cancelled === query.cancelled));
+      return { sort() { return this; }, async toArray() { return matched; } };
+    },
+    async bulkWrite(operations) {
+      for (const operation of operations) {
+        const { filter, update, upsert } = operation.updateOne;
+        let index = records.findIndex(record =>
+          (!('_id' in filter) || record._id === filter._id) &&
+          (!('groupId' in filter) || record.groupId === filter.groupId) &&
+          (!('serviceYear' in filter) || record.serviceYear === filter.serviceYear) &&
+          (!('date' in filter) || record.date === filter.date) &&
+          (!('key' in filter) || record.key === filter.key) &&
+          (!('cancelled' in filter) || record.cancelled === filter.cancelled));
+        if (index >= 0) records[index] = { ...records[index], ...update.$set };
+        else if (upsert) records.push({ ...filter, ...update.$set, _id: 'repair-added' });
+      }
+    },
+  });
+
+  const previousAllowedCode = process.env.LEGACY_REPAIR_GROUP_CODE;
+  process.env.LEGACY_REPAIR_GROUP_CODE = bot.anonymizeId(groupId);
+  try {
+    const first = await bot.repairLegacySeptember11(
+      groupId, { senderId: 'verified-user', conversationType: 'group' }
+    );
+    assert.match(first, /9\/11 舊資料修復完成/);
+    assert.match(first, /MongoDB有效訂單：7 筆/);
+    assert.match(first, /結算價總額：4473/);
+    assert.match(first, /客收總額：900/);
+    assert.match(first, /業績總額：5373/);
+    assert.match(first, /04:20，新北市中和區送，客收計價，客收900/);
+    assert.doesNotMatch(first, /\d+。04:50，新北市中和區送，978/);
+
+    const active = records.filter(record => record.groupId === groupId && !record.cancelled);
+    assert.equal(active.length, 7);
+    assert.equal(active.filter(record => record.time === '04:20').length, 1);
+    assert.equal(active.filter(record => record.time === '04:50' && record.price === 978).length, 0);
+    const monthly = await bot.buildMonthlyReport(groupId, 9, 2026);
+    assert.match(monthly, /總趟數：7 趟/);
+    assert.match(monthly, /結算價總額：4473/);
+    assert.match(monthly, /客收總額：900（共1筆）/);
+    assert.match(monthly, /業績總額：5373/);
+
+    const originalPost = axios.post;
+    let replyText = '';
+    axios.post = async (_url, payload) => {
+      replyText = payload.messages.map(message => message.text).join('\n');
+      return { status: 200 };
+    };
+    const server = bot.app.listen(0);
+    await new Promise(resolve => server.once('listening', resolve));
+    const { port } = server.address();
+    const body = JSON.stringify({ events: [{
+      type: 'message', replyToken: 'legacy-repair-reply',
+      source: { type: 'group', groupId, userId: 'verified-user' },
+      message: { type: 'text', id: 'legacy-repair-command', text: '修復 9/11 自客單' },
+    }] });
+    const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+      .update(Buffer.from(body)).digest('base64');
+    try {
+      const response = await fetch('http://127.0.0.1:' + port + '/webhook', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-line-signature': signature },
+        body,
+      });
+      assert.equal(response.status, 200);
+      assert.match(replyText, /已修復，沒有重複修改/);
+    } finally {
+      axios.post = originalPost;
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+    assert.equal(records.filter(record => record.groupId === groupId && !record.cancelled).length, 7);
+    assert.equal(records.filter(record => record.key ===
+      'manual-repair:2026-09-11:04-20:self-customer').length, 1);
+  } finally {
+    if (previousAllowedCode === undefined) delete process.env.LEGACY_REPAIR_GROUP_CODE;
+    else process.env.LEGACY_REPAIR_GROUP_CODE = previousAllowedCode;
+  }
+});
+
+test('9/11 舊資料修復遇到非指定群組或快照不同時完全停止', async () => {
+  let databaseCalled = false;
+  bot.__setOrdersCollectionForTests({
+    find() { databaseCalled = true; throw new Error('不應查詢'); },
+  });
+  const previousAllowedCode = process.env.LEGACY_REPAIR_GROUP_CODE;
+  process.env.LEGACY_REPAIR_GROUP_CODE = bot.anonymizeId('only-allowed-group');
+  try {
+    const result = await bot.repairLegacySeptember11('different-group');
+    assert.match(result, /只適用於已核對的指定群組/);
+    assert.match(result, /沒有變更任何資料/);
+    assert.equal(databaseCalled, false);
+
+    let bulkWriteCalled = false;
+    bot.__setOrdersCollectionForTests({
+      find() {
+        return {
+          sort() { return this; },
+          async toArray() { return [{
+            groupId: 'only-allowed-group', serviceYear: 2026, date: '9/11',
+            key: 'different-snapshot', time: '12:00', type: '送',
+            loc: '新北市板橋區', price: 700, remarks: [], cancelled: false,
+          }]; },
+        };
+      },
+      async bulkWrite() { bulkWriteCalled = true; },
+    });
+    const mismatch = await bot.repairLegacySeptember11('only-allowed-group');
+    assert.match(mismatch, /核對快照不同/);
+    assert.match(mismatch, /沒有變更任何資料/);
+    assert.equal(bulkWriteCalled, false);
+  } finally {
+    if (previousAllowedCode === undefined) delete process.env.LEGACY_REPAIR_GROUP_CODE;
+    else process.env.LEGACY_REPAIR_GROUP_CODE = previousAllowedCode;
+  }
+});
+
 test('9/7 修正資料不完整時整批停止且不寫入', async () => {
   let bulkWriteCalled = false;
   bot.__setOrdersCollectionForTests({
@@ -1043,6 +1299,90 @@ test('無標題自客單可經完整 webhook 寫入，客收直接列為業績�
     assert.match(replyText, /客收合計：900/);
     assert.match(replyText, /業績合計：900$/m);
     assert.doesNotMatch(replyText, /待確認/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
+test('無編號訂單未收到收回事件又被重貼時，依匿名顧客識別更新原單而不增加趟數', async () => {
+  const groupId = 'no-unsend-dedupe-group';
+  const records = [];
+  bot.__setOrdersCollectionForTests({
+    async findOne(query) {
+      return records.find(record => record.groupId === query.groupId && record.key === query.key &&
+        record.cancelled === query.cancelled &&
+        record.preventReactivation === query.preventReactivation) || null;
+    },
+    async updateOne(filter, update) {
+      const index = records.findIndex(record => record.groupId === filter.groupId &&
+        record.serviceYear === filter.serviceYear && record.date === filter.date && record.key === filter.key);
+      if (index >= 0) records[index] = { ...records[index], ...update.$set };
+      else records.push({ ...update.$set });
+    },
+    async updateMany() {},
+    find(query) {
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        (!('serviceYear' in query) || record.serviceYear === query.serviceYear) &&
+        (!('date' in query) || record.date === query.date) &&
+        (!('cancelled' in query) || record.cancelled === query.cancelled));
+      return { sort() { return this; }, async toArray() { return matched; } };
+    },
+  });
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const sendOrder = async (messageId, includeSettlement, phone = '0900000000') => {
+    const lines = [
+      '出發日期：9/12【05:00】', '乘車人數：2', '行李數量：2',
+      '航班編號：TEST123', '上車地點：新北市新店區測試路',
+      '下車地點：桃園機場第二航廈', '其他備註：',
+      '聯絡人：測試客戶', '電話：' + phone, '客收：1100',
+    ];
+    if (includeSettlement) lines.push('結算價：1100');
+    const body = JSON.stringify({ events: [{
+      type: 'message', replyToken: 'dedupe-reply-' + messageId,
+      source: { type: 'group', groupId, userId: 'dispatcher-user' },
+      message: { type: 'text', id: messageId, text: lines.join('\n') },
+    }] });
+    const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+      .update(Buffer.from(body)).digest('base64');
+    return fetch('http://127.0.0.1:' + port + '/webhook', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+  };
+  try {
+    let response = await sendOrder('dedupe-old-message', false);
+    assert.equal(response.status, 200);
+    response = await sendOrder('dedupe-new-message', true);
+    assert.equal(response.status, 200);
+    const active = records.filter(record => !record.cancelled);
+    assert.equal(active.length, 1);
+    assert.equal(active[0].key, 'line:dedupe-old-message:0');
+    assert.equal(active[0].lineMessageId, 'dedupe-new-message');
+    assert.equal(active[0].price, 1100);
+    assert.deepEqual(active[0].remarks, ['客收1100']);
+    assert.equal(active[0].customerKey.length, 10);
+    assert.match(replyText, /結算價合計：1100/);
+    assert.match(replyText, /客收合計：1100/);
+    assert.match(replyText, /業績合計：2200$/m);
+    assert.doesNotMatch(replyText, /2。/);
+
+    response = await sendOrder('dedupe-different-customer', true, '0911111111');
+    assert.equal(response.status, 200);
+    const twoCustomers = records.filter(record => !record.cancelled);
+    assert.equal(twoCustomers.length, 2);
+    assert.equal(new Set(twoCustomers.map(record => record.customerKey)).size, 2);
+    assert.match(replyText, /2。/);
+    assert.match(replyText, /結算價合計：2200/);
+    assert.match(replyText, /客收合計：2200/);
+    assert.match(replyText, /業績合計：4400$/m);
   } finally {
     axios.post = originalPost;
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
