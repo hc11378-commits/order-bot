@@ -12,7 +12,7 @@ const MONGO_URI = process.env.MONGO_URI?.trim(); // MongoDB Atlas 連線字串�
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '1.2.3-performance';
+const BOT_VERSION = '1.3.0-order-lifecycle';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -34,6 +34,7 @@ async function connectMongo() {
     const collection = db.collection('orders');
     await collection.createIndex({ groupId: 1, serviceYear: 1, date: 1, cancelled: 1 });
     await collection.createIndex({ groupId: 1, key: 1, cancelled: 1 });
+    await collection.createIndex({ groupId: 1, lineMessageId: 1, cancelled: 1 });
     // 舊資料沒有年份；以實際寫入時間補上，避免日後跨年度月結混在一起。
     await collection.updateMany(
       { serviceYear: { $exists: false }, updatedAt: { $type: 'date' } },
@@ -90,6 +91,7 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
         key,
         ...(audit.senderId ? { senderKey: anonymizeId(audit.senderId) } : {}),
         ...(audit.conversationType ? { conversationType: audit.conversationType } : {}),
+        ...(audit.messageId ? { lineMessageId: String(audit.messageId) } : {}),
         cancelled: false,
         updatedAt: new Date(),
       } },
@@ -187,6 +189,57 @@ async function refreshDateOrdersFromMongo(groupId, date, serviceYear = getBusine
     console.error('MongoDB 完整簡表同步失敗:', err.message);
     return current;
   }
+}
+
+// LINE 「收回訊息」會傳送 unsend 事件。依群組與原訊息 ID 精準取消，
+// 不使用日期或內容猜測，避免影響其他司機群組。
+async function handleLineUnsend(groupId, messageId) {
+  if (!groupId || !messageId) return [];
+  const affectedDates = new Set();
+
+  if (ordersCollection) {
+    try {
+      const records = await ordersCollection.find({
+        groupId,
+        lineMessageId: String(messageId),
+        cancelled: false,
+      }).toArray();
+      records.forEach(record => {
+        const date = normalizeDate(record.date);
+        if (date) affectedDates.add(date);
+      });
+      if (records.length) {
+        await ordersCollection.updateMany({
+          groupId,
+          lineMessageId: String(messageId),
+          cancelled: false,
+        }, { $set: {
+          cancelled: true,
+          cancellationReason: 'LINE訊息已收回',
+          unsentAt: new Date(),
+          updatedAt: new Date(),
+        } });
+      }
+    } catch (err) {
+      console.error('LINE 收回訊息處理失敗:', err.message);
+      return [];
+    }
+  }
+
+  const groupOrders = dailyOrders[groupId] || {};
+  for (const [date, dateOrders] of Object.entries(groupOrders)) {
+    for (const [key, order] of Object.entries(dateOrders)) {
+      if (order?.lineMessageId === String(messageId)) {
+        dateOrders[key] = null;
+        affectedDates.add(date);
+      }
+    }
+  }
+  for (const date of affectedDates) {
+    setChanged(groupId, date);
+    if (!TEST_MODE) scheduleFlush(groupId, date);
+  }
+  return [...affectedDates];
 }
 
 function setChanged(groupId, date) {
@@ -421,7 +474,7 @@ function splitBlocks(text) {
   }
 
   return blocks.filter(b =>
-    b.match(/結算價|客收\s*\d+/) ||
+    b.match(/結(?:算|單)價|客收[：:]?\s*\d+/) ||
     (b.match(/出發日期/) && b.match(/上車地點|下車地點/))
   );
 }
@@ -452,7 +505,7 @@ function extractDate(block) {
 }
 
 function extractPrice(block) {
-  const m = block.match(/結算價[：:\s]*([\d,]+\.?\d*)/);
+  const m = block.match(/結(?:算|單)價[：:\s]*([\d,]+\.?\d*)/);
   if (!m) return null;
   return parseFloat(m[1].replace(/,/g, ''));
 }
@@ -490,7 +543,7 @@ function extractLocation(block, type) {
 
 function detectRemarks(block) {
   const found = [];
-  const kesuM = block.match(/客收\s*([\d,]+(?:\.\d+)?)/);
+  const kesuM = block.match(/客收[：:]?\s*([\d,]+(?:\.\d+)?)/);
   if (kesuM) found.push('客收' + kesuM[1].replace(/,/g, ''));
   // 只讀取「其他備註」同一行；空白備註不可跨行把聯絡人或電話讀進來。
   const rLine = block.match(/其他備註[：:][ \t]*([^\r\n]*)/);
@@ -671,7 +724,7 @@ function extractPriceV2(block) {
   const p1 = extractPrice(block);
   if (p1 !== null) return p1;
   // 結算價 ：1800$ 這種格式
-  const m = block.match(/結算價[：:\s]*([\d,]+\.?\d*)\s*\$?/);
+  const m = block.match(/結(?:算|單)價[：:\s]*([\d,]+\.?\d*)\s*\$?/);
   if (m) return parseFloat(m[1].replace(/,/g,''));
   return null;
 }
@@ -753,9 +806,13 @@ function buildSummary(groupId, date, orders) {
       return;
     }
 
-    const priceStr = (o.price === null || o.price === undefined) ? '待確認金額' : fmtP(o.price);
-    if (o.price === null || o.price === undefined) hasUnconfirmed = true;
-    else total += o.price;
+    const orderCustomerCollection = getCustomerCollectionTotal(o);
+    const hasSettlementPrice = typeof o.price === 'number';
+    const priceStr = hasSettlementPrice
+      ? fmtP(o.price)
+      : (orderCustomerCollection > 0 ? '客收計價' : '待確認金額');
+    if (!hasSettlementPrice && orderCustomerCollection <= 0) hasUnconfirmed = true;
+    else if (hasSettlementPrice) total += o.price;
 
     const rStr = o.remarks.length ? o.remarks.join('、')+'，' : '';
 
@@ -975,16 +1032,30 @@ app.post('/webhook', async (req, res) => {
   try {
     const events = req.body.events || [];
     for (const event of events) {
+    const sourceId = event.source?.groupId || event.source?.roomId || event.source?.userId;
+    if (!sourceId) continue;
+
+    // 客服在 LINE 收回原訂單訊息時，立即依原訊息 ID 將該訂單標記取消。
+    if (event.type === 'unsend') {
+      const releaseSourceQueue = await acquireSourceQueue(sourceId);
+      try {
+        groupIds[sourceId] = true;
+        await handleLineUnsend(sourceId, event.unsend?.messageId);
+      } finally {
+        releaseSourceQueue();
+      }
+      continue;
+    }
+
     if (event.type !== 'message' || event.message.type !== 'text') continue;
 
     const rawText = event.message.text.trim();
     // 移除零寬字元、BOM等不可見字元，避免破壞正則比對（常見於手機輸入法/轉發訊息）
     const text = rawText.replace(/[\u200B-\u200D\uFEFF\u00A0]/g, (ch) => ch === '\u00A0' ? ' ' : '');
-    const sourceId = event.source.groupId || event.source.roomId || event.source.userId;
-    if (!sourceId) continue;
     const auditContext = {
       senderId: event.source.userId,
       conversationType: event.source.type || (event.source.groupId ? 'group' : event.source.roomId ? 'room' : 'user'),
+      messageId: event.message.id,
     };
     const releaseSourceQueue = await acquireSourceQueue(sourceId);
     try {
@@ -1073,6 +1144,7 @@ app.post('/webhook', async (req, res) => {
       let writeFailed = false;
       for (const [orderIndex, o] of newOrders.entries()) {
         const date = normalizeDate(o.date);
+        o.lineMessageId = String(event.message.id);
         const key = getOrderStorageKey(o, event.message.id, orderIndex);
         const saved = await saveOrderToMongo(sourceId, date, key, o, auditContext);
         if (!saved) writeFailed = true;
@@ -1163,9 +1235,14 @@ app.post('/webhook', async (req, res) => {
     }
 
     // ── 6. 新訂單（一般訂單、外車格式一二三四五）──
+    const coreOrderFieldCount = [
+      /出發日期/, /乘車人數/, /行李數量/, /航班編號/,
+      /上車地點/, /中間點/, /下車地點/, /其他備註/,
+      /聯絡人/, /(?:^|\n)\s*(?:電話|手機)[：:]/,
+      /客收\s*[：:]?\s*[\d,]+/, /結(?:算|單)價\s*[：:]?\s*[\d,]+/,
+    ].filter(pattern => pattern.test(text)).length;
     const looksLikeOrder =
-      (text.match(/接機|送機/) && text.match(/上車地點|下車地點/) &&
-        text.match(/結算價|客收\s*\d+|航班編號/)) || // 一般訂單，含僅客收/金額待確認
+      (coreOrderFieldCount >= 4 && /出發日期|上車地點|下車地點/.test(text)) || // 一般訂單、無標題自客單、格式不完整的疑似訂單
       (text.match(/用車日期/) && text.match(/搭車地區/)) ||  // 外車格式二
       (text.match(/時間[：:]/) && text.match(/貴賓[：:]/)) || // 外車格式三
       (text.includes('\t') && text.split('\t').length >= 15); // 外車格式四五
@@ -1173,7 +1250,7 @@ app.post('/webhook', async (req, res) => {
     if (looksLikeOrder) {
       const newOrders = parseOrders(text);
       if (!newOrders.length || newOrders.some(order => !normalizeDate(order.date))) {
-        await replyMessage(event.replyToken, '訂單格式無法完整辨識，沒有儲存任何資料。請檢查日期、時間與結算價。');
+        await replyMessage(event.replyToken, '訂單格式無法完整辨識，沒有儲存任何資料。請檢查日期、時間及上下車地點；只有客收也可以儲存。');
         continue;
       }
       const stagedOrders = [];
@@ -1181,6 +1258,7 @@ app.post('/webhook', async (req, res) => {
       for (const [orderIndex, o] of newOrders.entries()) {
         const date = normalizeDate(o.date);
         lastActiveDate[sourceId] = date; // 記錄最近使用的日期
+        o.lineMessageId = String(event.message.id);
         const key = getOrderStorageKey(o, event.message.id, orderIndex);
         const saved = await saveOrderToMongo(sourceId, date, key, o, auditContext);
         if (!saved) writeFailed = true;
@@ -1348,7 +1426,9 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
     }).sort({ time: 1, updatedAt: 1 }).toArray());
     const activeOrders = records.filter(record => !record.isPlaceholder && !record.isShuttle);
     const validOrders = activeOrders.filter(record => typeof record.price === 'number');
-    const pendingPriceCount = activeOrders.length - validOrders.length;
+    const pendingPriceCount = activeOrders.filter(record =>
+      typeof record.price !== 'number' && getCustomerCollectionTotal(record) <= 0
+    ).length;
     const settlementTotal = validOrders.reduce((sum, record) => sum + record.price, 0);
     const customerCollectionTotal = activeOrders.reduce(
       (sum, record) => sum + getCustomerCollectionTotal(record), 0
@@ -1357,7 +1437,9 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
     const senderKeys = new Set(records.map(record => record.senderKey || '舊資料').filter(Boolean));
     const orderLines = activeOrders.slice(0, 25).map((record, index) => {
       const location = record.type === '接' ? `接${record.loc || '?'}` : `${record.loc || '?'}送`;
-      const price = typeof record.price === 'number' ? fmtP(record.price) : '待確認金額';
+      const price = typeof record.price === 'number'
+        ? fmtP(record.price)
+        : (getCustomerCollectionTotal(record) > 0 ? '客收計價' : '待確認金額');
       const remarks = Array.isArray(record.remarks) && record.remarks.length
         ? `，${record.remarks.join('、')}` : '';
       return `${index + 1}。${record.time || '時間待確認'}，${location}，${price}${remarks}`;
@@ -1556,7 +1638,7 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
     if (typeof o.price === 'number') {
       settlementTotal += o.price;
       stats.settlement += o.price;
-    } else {
+    } else if (getCustomerCollectionTotal(o) <= 0) {
       pendingPriceCount++;
       stats.pending++;
     }
@@ -1706,6 +1788,7 @@ module.exports = {
   acquireSourceQueue,
   saveOrderToMongo,
   markOrderCancelledInMongo,
+  handleLineUnsend,
   buildMonthlyReport,
   buildGroupDiagnostic,
   anonymizeId,
