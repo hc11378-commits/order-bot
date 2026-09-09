@@ -1170,6 +1170,115 @@ test('無編號自客單收回後重貼修改版只保留一筆有效訂單', as
   }
 });
 
+test('編號加拉回改派、改派或收回後均永久排除，重貼也不回到簡表與月結', async () => {
+  const commands = [
+    ['withdraw-lock-group-1', 'LOCK0001', 'LOCK0001 拉回改派'],
+    ['withdraw-lock-group-2', 'LOCK0002', 'LOCK0002 改派'],
+    ['withdraw-lock-group-3', 'LOCK0003', 'LOCK0003 收回'],
+    ['withdraw-lock-group-4', 'LOCK0004', '拉回改派 LOCK0004'],
+  ];
+  const records = commands.map(([groupId, orderId], index) => ({
+    groupId, serviceYear: 2026, date: '9/11', key: orderId, orderId,
+    time: '0' + (index + 5) + ':00', type: '送', loc: '新北市板橋區',
+    pax: 1, price: 700 + index, remarks: [], cancelled: false,
+    updatedAt: new Date('2026-09-09T0' + index + ':00:00.000Z'),
+  }));
+  records.push({ ...records[0], date: '9/12', price: 999, updatedAt: new Date('2026-09-09T05:00:00.000Z') });
+  bot.__setOrdersCollectionForTests({
+    async findOne(query) {
+      if (query.$or) {
+        return records.find(record => record.groupId === query.groupId &&
+          record.cancelled === query.cancelled &&
+          query.$or.some(condition => condition.key === record.key || condition.orderId === record.orderId)) || null;
+      }
+      return records.find(record => record.groupId === query.groupId &&
+        record.key === query.key && record.cancelled === query.cancelled &&
+        record.preventReactivation === query.preventReactivation) || null;
+    },
+    async updateOne(filter, update, options = {}) {
+      let index;
+      if (filter.suppressionOnly) {
+        index = records.findIndex(record => record.groupId === filter.groupId &&
+          record.key === filter.key && record.suppressionOnly === true);
+      } else if ('serviceYear' in filter && 'date' in filter) {
+        index = records.findIndex(record => record.groupId === filter.groupId &&
+          record.serviceYear === filter.serviceYear && record.date === filter.date && record.key === filter.key);
+      } else {
+        index = records.findIndex(record => record.groupId === filter.groupId &&
+          record.key === filter.key && record.cancelled === filter.cancelled);
+      }
+      if (index >= 0) records[index] = { ...records[index], ...update.$set };
+      else if (options.upsert) records.push({ ...filter, ...update.$set });
+    },
+    async updateMany(filter, update) {
+      const matched = records.filter(record => record.groupId === filter.groupId &&
+        (!('key' in filter) || record.key === filter.key) &&
+        (!('cancelled' in filter) || record.cancelled === filter.cancelled));
+      matched.forEach(record => Object.assign(record, update.$set));
+      return { matchedCount: matched.length };
+    },
+    find(query) {
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        (!('serviceYear' in query) || record.serviceYear === query.serviceYear) &&
+        (!('date' in query) || record.date === query.date) &&
+        (!('cancelled' in query) || record.cancelled === query.cancelled));
+      return { sort() { return this; }, async toArray() { return matched; } };
+    },
+  });
+  const originalPost = axios.post;
+  const replies = [];
+  axios.post = async (_url, payload) => {
+    replies.push(payload.messages.map(message => message.text).join('\n'));
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const postWebhook = async events => {
+    const body = JSON.stringify({ events });
+    const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+      .update(Buffer.from(body)).digest('base64');
+    return fetch('http://127.0.0.1:' + port + '/webhook', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+  };
+  try {
+    for (const [groupId, orderId, command] of commands) {
+      let response = await postWebhook([{
+        type: 'message', replyToken: 'withdraw-reply-' + orderId,
+        source: { type: 'group', groupId, userId: 'dispatcher-user' },
+        message: { type: 'text', id: 'withdraw-command-' + orderId, text: command },
+      }]);
+      assert.equal(response.status, 200);
+      assert.match(replies.at(-1), /目前無有效訂單/);
+      assert.match(replies.at(-1), /業績合計：0/);
+
+      const repostText = [
+        '五座送機', orderId, '出發日期：2026/9/11 08:30',
+        '乘車人數：1', '行李數量：1', '航班編號：TEST123',
+        '上車地點：新北市板橋區測試路', '下車地點：桃園機場第二航廈',
+        '其他備註：', '聯絡人：測試客戶', '電話：0900000000', '結算價：700',
+      ].join('\n');
+      response = await postWebhook([{
+        type: 'message', replyToken: 'repost-reply-' + orderId,
+        source: { type: 'group', groupId, userId: 'dispatcher-user' },
+        message: { type: 'text', id: 'repost-message-' + orderId, text: repostText },
+      }]);
+      assert.equal(response.status, 200);
+      assert.match(replies.at(-1), /已忽略訂單/);
+      assert.match(replies.at(-1), /不會重新加入簡表或月結/);
+      assert.equal(records.filter(record => record.groupId === groupId && !record.cancelled).length, 0);
+
+      const monthly = await bot.buildMonthlyReport(groupId, 9, 2026);
+      assert.match(monthly, /尚無有效訂單紀錄/);
+      assert.doesNotMatch(monthly, /700/);
+    }
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+});
+
 test('MongoDB 寫入失敗時不回覆虛假成功簡表', async () => {
   bot.__setOrdersCollectionForTests({
     async updateOne() { throw new Error('simulated database failure'); },

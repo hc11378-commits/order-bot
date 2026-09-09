@@ -12,7 +12,7 @@ const MONGO_URI = process.env.MONGO_URI?.trim(); // MongoDB Atlas 連線字串�
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '1.3.0-order-lifecycle';
+const BOT_VERSION = '1.3.1-withdrawal-lock';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -81,6 +81,17 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
     const canonicalDate = normalizeDate(date);
     if (!canonicalDate) throw new Error(`無效的服務日期：${date}`);
     const serviceYear = extractServiceYear(order.date);
+    // 已由客服明確取消、拉回、改派或收回的訂單，留下永久封鎖標記。
+    // 即使 LINE 重送舊 webhook 或有人再次貼上原單，也不能把 cancelled 改回 false。
+    if (typeof ordersCollection.findOne === 'function') {
+      const suppression = await ordersCollection.findOne({
+        groupId,
+        key,
+        cancelled: true,
+        preventReactivation: true,
+      });
+      if (suppression) return 'suppressed';
+    }
     await ordersCollection.updateOne(
       { groupId, serviceYear, date: canonicalDate, key },
       { $set: {
@@ -122,15 +133,53 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
 }
 
 // 標記一筆訂單為已取消（月結統計時會排除）
-async function markOrderCancelledInMongo(groupId, date, key) {
+async function markOrderCancelledInMongo(groupId, date, key, reason = '訂單已取消') {
   if (!ordersCollection) return;
   try {
-    await ordersCollection.updateOne(
-      { groupId, key, cancelled: false },
-      { $set: { cancelled: true, updatedAt: new Date() } }
-    );
+    const filter = { groupId, key, cancelled: false };
+    const update = { $set: {
+      cancelled: true,
+      cancellationReason: reason,
+      preventReactivation: true,
+      updatedAt: new Date(),
+    } };
+    // 舊資料可能曾因歷史版本產生相同 key 的重複紀錄，正式資料庫一次全部排除。
+    if (typeof ordersCollection.updateMany === 'function') {
+      const result = await ordersCollection.updateMany(filter, update);
+      if (typeof result?.matchedCount === 'number' && result.matchedCount > 0) return;
+    }
+    // 簡化的測試替身或舊環境沒有回傳 matchedCount 時，仍保留單筆相容路徑。
+    await ordersCollection.updateOne(filter, update);
   } catch (err) {
     console.error('MongoDB 更新失敗:', err.message);
+  }
+}
+
+// 即使撤回指令比原訂單先送達，仍先建立封鎖紀錄；日後同群組、同訂單編號
+// 再次出現時會被拒絕，不會回到簡表或月結。
+async function blockOrderReactivation(groupId, key, reason, audit = {}) {
+  if (!ordersCollection || !groupId || !key) return false;
+  try {
+    await ordersCollection.updateOne(
+      { groupId, key, suppressionOnly: true },
+      { $set: {
+        groupId,
+        key,
+        orderId: key,
+        suppressionOnly: true,
+        cancelled: true,
+        preventReactivation: true,
+        cancellationReason: reason,
+        ...(audit.senderId ? { senderKey: anonymizeId(audit.senderId) } : {}),
+        ...(audit.conversationType ? { conversationType: audit.conversationType } : {}),
+        updatedAt: new Date(),
+      } },
+      { upsert: true }
+    );
+    return true;
+  } catch (err) {
+    console.error('MongoDB 撤回封鎖寫入失敗:', err.message);
+    return false;
   }
 }
 
@@ -216,6 +265,7 @@ async function handleLineUnsend(groupId, messageId) {
         }, { $set: {
           cancelled: true,
           cancellationReason: 'LINE訊息已收回',
+          preventReactivation: true,
           unsentAt: new Date(),
           updatedAt: new Date(),
         } });
@@ -1093,6 +1143,43 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    // ── 明確撤回：支援「編號 拉回改派／改派／收回」及動作在前的寫法 ──
+    // 這類只有指令、沒有新訂單內容的訊息，一律移除原單並留下禁止復活標記。
+    const withdrawSuffixM = text.match(/^([A-Z0-9]{6,15})\s*(?:[+＋]\s*)?(拉回改派|改派|收回)$/);
+    const withdrawPrefixM = text.match(/^(拉回改派|改派|收回)\s*(?:[+＋]\s*)?([A-Z0-9]{6,15})$/);
+    if (withdrawSuffixM || withdrawPrefixM) {
+      const orderId = withdrawSuffixM ? withdrawSuffixM[1] : withdrawPrefixM[2];
+      const action = withdrawSuffixM ? withdrawSuffixM[2] : withdrawPrefixM[1];
+      const reason = `客服${action}`;
+      const found = await findOrderDate(sourceId, orderId);
+      if (found) {
+        // 清除記憶體內同編號的所有日期版本，避免舊版留下的重複紀錄進入排程簡表。
+        const normalizedId = orderId.replace(/\s/g, '');
+        for (const [date, dateOrders] of Object.entries(dailyOrders[sourceId] || {})) {
+          for (const [key, order] of Object.entries(dateOrders)) {
+            const sameKey = key.replace(/\s/g, '') === normalizedId;
+            const sameOrderId = order?.orderId && String(order.orderId).replace(/\s/g, '') === normalizedId;
+            if (sameKey || sameOrderId) {
+              dateOrders[key] = null;
+              setChanged(sourceId, date);
+            }
+          }
+        }
+        await markOrderCancelledInMongo(sourceId, found.date, found.key, reason);
+      }
+      const blocked = await blockOrderReactivation(sourceId, orderId, reason, auditContext);
+      if (!blocked) {
+        await replyMessage(event.replyToken,
+          `處理失敗：無法在資料庫保存 ${orderId} 的${action}狀態，請聯繫管理員查看 Render Logs。`);
+      } else if (found) {
+        await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
+      } else {
+        await replyMessage(event.replyToken,
+          `${orderId} 已標記為${action}；即使原訂單稍後再次送達，也不會加入簡表或月結。`);
+      }
+      continue;
+    }
+
     // ── 1. 取消：「XXX 訂單取消」或「XXX 取消」──
     const cancelM = text.match(/([A-Z0-9]{6,15})\s*(訂單取消|取消)/);
     if (cancelM) {
@@ -1101,7 +1188,8 @@ app.post('/webhook', async (req, res) => {
       if (found) {
         getDateOrders(sourceId, found.date, true)[found.key] = null;
         setChanged(sourceId, found.date);
-        await markOrderCancelledInMongo(sourceId, found.date, found.key);
+        await markOrderCancelledInMongo(sourceId, found.date, found.key, '客服取消');
+        await blockOrderReactivation(sourceId, orderId, '客服取消', auditContext);
         await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
       } else {
         await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有取消任何資料。`);
@@ -1117,7 +1205,8 @@ app.post('/webhook', async (req, res) => {
       if (found) {
         getDateOrders(sourceId, found.date, true)[found.key] = null;
         setChanged(sourceId, found.date);
-        await markOrderCancelledInMongo(sourceId, found.date, found.key);
+        await markOrderCancelledInMongo(sourceId, found.date, found.key, '客服拉回改派');
+        await blockOrderReactivation(sourceId, orderId, '客服拉回改派', auditContext);
         await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
       } else {
         await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有拉回或改派任何資料。`);
@@ -1142,13 +1231,20 @@ app.post('/webhook', async (req, res) => {
       }
       const stagedOrders = [];
       let writeFailed = false;
+      const suppressedOrders = [];
       for (const [orderIndex, o] of newOrders.entries()) {
         const date = normalizeDate(o.date);
         o.lineMessageId = String(event.message.id);
         const key = getOrderStorageKey(o, event.message.id, orderIndex);
         const saved = await saveOrderToMongo(sourceId, date, key, o, auditContext);
-        if (!saved) writeFailed = true;
+        if (saved === 'suppressed') suppressedOrders.push(key);
+        else if (!saved) writeFailed = true;
         else stagedOrders.push({ o, date, key });
+      }
+      if (suppressedOrders.length) {
+        await replyMessage(event.replyToken,
+          `改派停止：新訂單 ${suppressedOrders.join('、')} 已被標記為拉回、改派或收回，不會重新加入簡表。`);
+        continue;
       }
       if (writeFailed) {
         await replyMessage(event.replyToken,
@@ -1163,7 +1259,8 @@ app.post('/webhook', async (req, res) => {
       if (!replacementKeys.has(`${found.date}|${found.key}`)) {
         getDateOrders(sourceId, found.date, true)[found.key] = null;
         setChanged(sourceId, found.date);
-        await markOrderCancelledInMongo(sourceId, found.date, found.key);
+        await markOrderCancelledInMongo(sourceId, found.date, found.key, '改派原單');
+        await blockOrderReactivation(sourceId, found.key, '改派原單', auditContext);
       }
       const date = normalizeDate(newOrders[0]?.date);
       await sendOrScheduleSummary(event.replyToken, sourceId, date);
@@ -1179,7 +1276,8 @@ app.post('/webhook', async (req, res) => {
         if (found) {
           getDateOrders(sourceId, found.date, true)[found.key] = null;
           setChanged(sourceId, found.date);
-          await markOrderCancelledInMongo(sourceId, found.date, found.key);
+          await markOrderCancelledInMongo(sourceId, found.date, found.key, '客服拉回');
+          await blockOrderReactivation(sourceId, orderId, '客服拉回', auditContext);
           await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
         } else {
           await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有拉回任何資料。`);
@@ -1255,19 +1353,26 @@ app.post('/webhook', async (req, res) => {
       }
       const stagedOrders = [];
       let writeFailed = false;
+      const suppressedOrders = [];
       for (const [orderIndex, o] of newOrders.entries()) {
         const date = normalizeDate(o.date);
         lastActiveDate[sourceId] = date; // 記錄最近使用的日期
         o.lineMessageId = String(event.message.id);
         const key = getOrderStorageKey(o, event.message.id, orderIndex);
         const saved = await saveOrderToMongo(sourceId, date, key, o, auditContext);
-        if (!saved) writeFailed = true;
+        if (saved === 'suppressed') suppressedOrders.push(key);
+        else if (!saved) writeFailed = true;
         else stagedOrders.push({ o, date, key });
       }
       if (writeFailed) {
         await replyMessage(event.replyToken,
           '訂單儲存失敗：資料庫未連線或寫入失敗，本次不回覆成功簡表。\n可稍後安全重貼原訂單，同一訂單編號不會重複計算。'
         );
+        continue;
+      }
+      if (!stagedOrders.length && suppressedOrders.length) {
+        await replyMessage(event.replyToken,
+          `已忽略訂單 ${suppressedOrders.join('、')}：該訂單已標記為拉回、改派或收回，不會重新加入簡表或月結。`);
         continue;
       }
       for (const { o, date, key } of stagedOrders) {
@@ -1788,6 +1893,7 @@ module.exports = {
   acquireSourceQueue,
   saveOrderToMongo,
   markOrderCancelledInMongo,
+  blockOrderReactivation,
   handleLineUnsend,
   buildMonthlyReport,
   buildGroupDiagnostic,
