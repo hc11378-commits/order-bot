@@ -5,6 +5,7 @@ const { MongoClient } = require('mongodb');
 const { zipSync, strToU8 } = require('fflate');
 
 const app = express();
+app.disable('x-powered-by');
 
 // ── 機密資訊：一律從環境變數讀取，不寫死在程式碼裡 ──
 const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET?.trim();
@@ -13,7 +14,7 @@ const MONGO_URI = process.env.MONGO_URI?.trim(); // MongoDB Atlas 連線字串�
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '1.4.0-summary-excel';
+const BOT_VERSION = '2.0.0-fused';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -170,7 +171,7 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
 
 // 標記一筆訂單為已取消（月結統計時會排除）
 async function markOrderCancelledInMongo(groupId, date, key, reason = '訂單已取消') {
-  if (!ordersCollection) return;
+  if (!ordersCollection) return false;
   try {
     const filter = { groupId, key, cancelled: false };
     const update = { $set: {
@@ -182,12 +183,14 @@ async function markOrderCancelledInMongo(groupId, date, key, reason = '訂單已
     // 舊資料可能曾因歷史版本產生相同 key 的重複紀錄，正式資料庫一次全部排除。
     if (typeof ordersCollection.updateMany === 'function') {
       const result = await ordersCollection.updateMany(filter, update);
-      if (typeof result?.matchedCount === 'number' && result.matchedCount > 0) return;
+      if (typeof result?.matchedCount === 'number' && result.matchedCount > 0) return true;
     }
     // 簡化的測試替身或舊環境沒有回傳 matchedCount 時，仍保留單筆相容路徑。
-    await ordersCollection.updateOne(filter, update);
+    const result = await ordersCollection.updateOne(filter, update);
+    return result?.acknowledged !== false;
   } catch (err) {
     console.error('MongoDB 更新失敗:', err.message);
+    return false;
   }
 }
 
@@ -464,32 +467,85 @@ function getCity(addr) {
   return getCityMatch(addr)?.city || null;
 }
 
+const OFFICIAL_REGIONS = require('./regions.json').cities;
+
 function findRegionInCity(addr, city) {
-  const regions = REGIONS_BY_CITY[city] || [];
-  for (const region of [...regions].sort((a, b) => b.length - a.length)) {
-    const matched = addr.match(new RegExp(`${region}([區鄉鎮市])`));
-    if (matched) return { region, suffix: matched[1] };
-  }
-  return null;
+  const names = OFFICIAL_REGIONS[CITY_FULL_NAMES[city]] || [];
+  const matches = names.filter(name => addr.includes(name))
+    .sort((a, b) => addr.indexOf(a) - addr.indexOf(b) || b.length - a.length);
+  const name = matches[0];
+  return name ? { region: name.slice(0, -1), suffix: name.slice(-1) } : null;
 }
 
 function findRegionWithoutCity(addr) {
-  // 先比對完整的官方行政區名稱，不能用任意「某某區」猜測縣市。
   const candidates = [];
-  for (const [city, regions] of Object.entries(REGIONS_BY_CITY)) {
-    for (const region of regions) {
-      const matched = addr.match(new RegExp(`${region}([區鄉鎮市])`));
-      if (matched) candidates.push({ city, region, suffix: matched[1] });
-    }
+  for (const city of Object.keys(CITY_FULL_NAMES)) {
+    const match = findRegionInCity(addr, city);
+    if (match) candidates.push({ city, ...match });
   }
   if (!candidates.length) return null;
+  candidates.sort((a, b) => addr.indexOf(a.region + a.suffix) - addr.indexOf(b.region + b.suffix)
+    || b.region.length - a.region.length);
+  const first = candidates[0];
+  const sameName = candidates.filter(item => item.region === first.region && item.suffix === first.suffix);
+  return sameName.length === 1 ? first : { ...first, city: null };
+}
 
-  // 同名行政區（例如中正區、信義區）在地址缺少縣市時不可武斷猜測。
-  const firstRegion = candidates[0].region;
-  const sameRegion = candidates.filter(item => item.region === firstRegion);
-  return sameRegion.length === 1
-    ? sameRegion[0]
-    : { city: null, region: firstRegion, suffix: sameRegion[0].suffix };
+// 僅縮短顯示，資料庫保留正式名稱，避免影響歷史訂單比對與 Excel。
+function compactLocation(location) {
+  return String(location || '').split('→').map(part => {
+    let text = part.trim().replace(/臺/g, '台');
+    if (text.startsWith('縣市待確認：')) {
+      const resolved = parseAddr(text.slice('縣市待確認：'.length));
+      if (!resolved || resolved.startsWith('縣市待確認：')) return text;
+      text = resolved;
+    }
+    for (const [city, names] of Object.entries(OFFICIAL_REGIONS)) {
+      if (!text.startsWith(city)) continue;
+      const rest = text.slice(city.length);
+      if (!rest) return city.slice(0, -1);
+      const name = names.find(name => name === rest);
+      if (name) return city.slice(0, -1) + name.slice(0, -1);
+    }
+    return text;
+  }).join('→');
+}
+
+function formatOrderLocation(order) {
+  const location = compactLocation(order.loc || '?');
+  return order.type === 'transfer' ? `交通趟，${location}` : `${order.type === '接' ? '接' : '送'}${location}`;
+}
+
+// 指令可在編號前後、分行或含標點；欄位備註及否定句不視為撤回。
+function parseDispatchAction(rawText) {
+  const text = String(rawText).normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').toUpperCase();
+  const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const relevant = lines.filter(line => !/^(?:其他備註|備註|聯絡人|電話|手機|航班|出發日期|上車地點|下車地點|結算價|乘車人數|行李|姓名|車號|車型)/.test(line));
+  const actions = relevant.filter(line => /拉回\s*改派|拉回|取消|收回|改派/.test(line)
+    && !/(?:不要|不用|不可|不能|不需|無需|勿|未|尚未|不)[\s，,]*(?:拉回|取消|收回|改派)|取消費|取消規則|取消政策|是否|能否|可否|嗎|[?？]/.test(line));
+  if (!actions.length) return null;
+  const actionText = actions.join('\n');
+  const action = /拉回\s*改派/.test(actionText) ? '拉回改派'
+    : /取消/.test(actionText) ? '取消' : /拉回/.test(actionText) ? '拉回'
+    : /收回/.test(actionText) ? '收回' : '改派';
+  // 保留「舊編號 改派 + 新訂單」既有替換流程。
+  if (action === '改派' && /出發日期|用車日期|貴賓[：:]/.test(text)) return null;
+  const ids = new Set();
+  const protectedIds = new Set();
+  for (const line of relevant) {
+    if (/(?:不要|不用|不可|不能|不需|無需|勿|未|尚未|不)[\s，,]*(?:拉回|取消|收回|改派)|保留|維持原單/.test(line)) {
+      for (const match of line.matchAll(/(?<![A-Z0-9])([A-Z0-9]{6,15})(?![A-Z0-9])/g)) protectedIds.add(match[1]);
+      continue;
+    }
+    for (const match of line.matchAll(/(?<![A-Z0-9])([A-Z0-9]{6,15})(?![A-Z0-9])/g)) {
+      const id = match[1];
+      if (/[A-Z]/.test(id) && /\d/.test(id)) ids.add(id);
+      else if (/^\d+$/.test(id) && (/訂單(?:編號|號碼|號)?\s*[:：]/.test(line) || line === id)) ids.add(id);
+    }
+  }
+  for (const id of protectedIds) ids.delete(id);
+  if (!ids.size) return { action, error: '找不到訂單編號，請提供完整編號。' };
+  return ids.size === 1 ? { action, orderId: [...ids][0] } : { action, orderIds: [...ids] };
 }
 
 function parseAddr(addr) {
@@ -932,14 +988,7 @@ function buildSummary(groupId, date, orders, options = {}) {
     const visibleRemarks = getSummaryLineRemarks(o);
     const rStr = visibleRemarks.length ? visibleRemarks.join('、')+'，' : '';
 
-    let locStr;
-    if (o.type === 'transfer') {
-      locStr = `交通趟，${o.loc}`;
-    } else if (o.type === '接') {
-      locStr = `接${o.loc}`;
-    } else {
-      locStr = `${o.loc}送`;
-    }
+    const locStr = formatOrderLocation(o);
 
     lines.push(`${i+1}。${o.time}，${locStr}，${rStr}${o.pax}${typeof o.pax === 'string' && o.pax.includes('人') ? '' : '人'}，${priceStr}`);
   });
@@ -1039,6 +1088,7 @@ async function findOrderDate(groupId, orderId) {
       }
     } catch (err) {
       console.error('MongoDB 訂單查找失敗:', err.message);
+      throw err;
     }
   }
   return null;
@@ -1075,10 +1125,50 @@ async function sendOrScheduleSummary(replyToken, groupId, date) {
   await replyMessage(replyToken, summary);
 }
 
+function buildCommandHelp() {
+  const currentYear = getBusinessDateParts().year;
+  return [
+    `機場接送 Bot 指令（版本 ${BOT_VERSION}）`,
+    '',
+    '【查詢】',
+    '測試：確認 Bot 與版本',
+    '指令／說明：顯示本說明',
+    '簡表：最近服務日簡表',
+    '簡表 10/27：指定日期簡表',
+    `簡表 ${currentYear}/10/27：指定年份與日期簡表`,
+    '群組診斷 10/27：只讀診斷，不修改資料',
+    `群組診斷 ${currentYear}/10/27：指定年份診斷`,
+    '',
+    '【月結】',
+    '月結：當月報表',
+    '月結 10月：今年指定月份',
+    `月結 ${currentYear}/10：指定年份與月份`,
+    '月結 Excel：當月 Excel',
+    '月結 10月 Excel：今年指定月份 Excel',
+    `月結 ${currentYear}/10 Excel：指定年份與月份 Excel`,
+    '',
+    '【訂單異動；ABC12345 請換成實際編號】',
+    'ABC12345 取消',
+    'ABC12345 收回',
+    'ABC12345 拉回',
+    'ABC12345 改派',
+    'ABC12345 拉回改派',
+    '多筆編號可逐行輸入，最後一行輸入「以上取消」等動作',
+    '',
+    '【其他】',
+    '補12送／補09接：建立待補提示',
+    '0740 蘆竹交通車 3人：建立交通車紀錄',
+    '',
+    '直接貼完整訂單不需要另外輸入指令。所有查詢與異動只作用於目前群組。',
+  ].join('\n');
+}
+
 // ════════════════════════════════════════
 // Webhook
 // ════════════════════════════════════════
 app.use(express.json({
+  limit: '512kb',
+  inflate: false,
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
 
@@ -1183,9 +1273,14 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    if (/^(?:指令|說明|help)$/i.test(text)) {
+      await replyMessage(event.replyToken, buildCommandHelp());
+      continue;
+    }
+
     // 只讀診斷：可指定服務日，例如「群組診斷 9/10」。
     // 不新增、不取消、不修改任何訂單。
-    const diagnosticMatch = text.match(/^群組診斷(?:\s*(\d{1,2}\/\d{1,2}))?$/);
+    const diagnosticMatch = text.match(/^群組診斷(?:\s*(\d{4}[\/-]\d{1,2}[\/-]\d{1,2}|\d{1,2}\/\d{1,2}))?$/);
     if (diagnosticMatch) {
       const report = await buildGroupDiagnostic(sourceId, auditContext, new Date(), diagnosticMatch[1] || null);
       await replyMessage(event.replyToken, report);
@@ -1193,7 +1288,7 @@ app.post('/webhook', async (req, res) => {
     }
 
     // 手動簡表：只讀取目前群組，可指定服務日，例如「簡表 9/10」。
-    const summaryMatch = text.match(/^簡表(?:\s*(\d{1,2}\/\d{1,2}))?$/);
+    const summaryMatch = text.match(/^簡表(?:\s*(\d{4}[\/-]\d{1,2}[\/-]\d{1,2}|\d{1,2}\/\d{1,2}))?$/);
     if (summaryMatch) {
       const report = await buildRequestedSummary(sourceId, summaryMatch[1] || null, new Date());
       await replyMessage(event.replyToken, report);
@@ -1201,15 +1296,13 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (/^修復\s*已確認舊資料$/.test(text)) {
-      const report = await repairConfirmedLegacyData(sourceId, auditContext);
-      await replyMessage(event.replyToken, report);
+      await replyMessage(event.replyToken, '此一次性修復指令已完成並退役，沒有修改任何資料。請改用「群組診斷 日期」檢查目前資料。');
       continue;
     }
 
     // 僅處理已核對過的 9/11 舊資料；完整結果會在同一則回覆中再次驗證。
     if (/^修復\s*9\/11\s*自客單$/.test(text)) {
-      const report = await repairLegacySeptember11(sourceId, auditContext);
-      await replyMessage(event.replyToken, report);
+      await replyMessage(event.replyToken, '此一次性修復指令已完成並退役，沒有修改任何資料。請改用「群組診斷 日期」檢查目前資料。');
       continue;
     }
 
@@ -1219,6 +1312,22 @@ app.post('/webhook', async (req, res) => {
       await replyMessage(event.replyToken,
         `安全保護：舊式「${text}」指令已停用，沒有修改任何資料。\n請先輸入「群組診斷」。`
       );
+      continue;
+    }
+
+    const yearMonthCmd = parseYearMonthCommand(text);
+    if (yearMonthCmd) {
+      if (yearMonthCmd.error) {
+        await replyMessage(event.replyToken, `年月無效，請使用例如「月結 ${getBusinessDateParts().year}/10」或「月結 ${getBusinessDateParts().year}/10 Excel」。`);
+        continue;
+      }
+      const report = await buildMonthlyReport(sourceId, yearMonthCmd.month, yearMonthCmd.year);
+      if (!yearMonthCmd.excel || /尚無有效訂單|無法使用|發生錯誤/.test(report)) {
+        await replyMessage(event.replyToken, report);
+        continue;
+      }
+      const url = createMonthlyExcelDownloadUrl(sourceId, yearMonthCmd.year, yearMonthCmd.month);
+      await replyMessage(event.replyToken, `${report}\n\nExcel下載（24小時有效）：\n${url}`);
       continue;
     }
 
@@ -1248,79 +1357,66 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
-    // ── 明確撤回：支援「編號 拉回改派／改派／收回」及動作在前的寫法 ──
-    // 這類只有指令、沒有新訂單內容的訊息，一律移除原單並留下禁止復活標記。
-    const withdrawSuffixM = text.match(/^([A-Z0-9]{6,15})\s*(?:[+＋]\s*)?(拉回改派|改派|收回)$/);
-    const withdrawPrefixM = text.match(/^(拉回改派|改派|收回)\s*(?:[+＋]\s*)?([A-Z0-9]{6,15})$/);
-    if (withdrawSuffixM || withdrawPrefixM) {
-      const orderId = withdrawSuffixM ? withdrawSuffixM[1] : withdrawPrefixM[2];
-      const action = withdrawSuffixM ? withdrawSuffixM[2] : withdrawPrefixM[1];
-      const reason = `客服${action}`;
-      const found = await findOrderDate(sourceId, orderId);
-      if (found) {
-        // 清除記憶體內同編號的所有日期版本，避免舊版留下的重複紀錄進入排程簡表。
-        const normalizedId = orderId.replace(/\s/g, '');
-        for (const [date, dateOrders] of Object.entries(dailyOrders[sourceId] || {})) {
-          for (const [key, order] of Object.entries(dateOrders)) {
-            const sameKey = key.replace(/\s/g, '') === normalizedId;
-            const sameOrderId = order?.orderId && String(order.orderId).replace(/\s/g, '') === normalizedId;
-            if (sameKey || sameOrderId) {
-              dateOrders[key] = null;
-              setChanged(sourceId, date);
+    const withdrawal = parseDispatchAction(text);
+    if (withdrawal) {
+      if (withdrawal.error) {
+        await replyMessage(event.replyToken, `處理停止：${withdrawal.error} 沒有變更任何資料。`);
+        continue;
+      }
+      const { action } = withdrawal;
+      const orderIds = withdrawal.orderIds || [withdrawal.orderId];
+      const completed = [];
+      const failed = [];
+      const affectedDates = new Set();
+      for (const orderId of orderIds) {
+        try {
+          const found = await findOrderDate(sourceId, orderId);
+          const dates = new Set(found ? [found.date] : []);
+          // 也收集重啟前或舊版留下的其他日期，讓每個受影響簡表都能更新。
+          if (ordersCollection?.find) {
+            const records = await ordersCollection.find({ groupId: sourceId, key: orderId, cancelled: false }).toArray();
+            for (const record of records) {
+              const date = normalizeDate(record.date);
+              if (date) dates.add(date);
             }
           }
+          const reason = `客服${action}`;
+          const cancelled = (!found && !dates.size) || await markOrderCancelledInMongo(sourceId, found?.date, found?.key || orderId, reason);
+          const blocked = cancelled && await blockOrderReactivation(sourceId, orderId, reason, auditContext);
+          if (!blocked) { failed.push(orderId); continue; }
+          for (const [date, orders] of Object.entries(dailyOrders[sourceId] || {})) {
+            for (const [key, order] of Object.entries(orders)) {
+              if (key.toUpperCase() === orderId || String(order?.orderId || '').toUpperCase() === orderId) {
+                orders[key] = null;
+                dates.add(date);
+              }
+            }
+          }
+          for (const date of dates) { setChanged(sourceId, date); affectedDates.add(date); }
+          completed.push(orderId);
+        } catch (err) {
+          console.error('批次撤回處理失敗:', orderId, err.message);
+          failed.push(orderId);
         }
-        await markOrderCancelledInMongo(sourceId, found.date, found.key, reason);
       }
-      const blocked = await blockOrderReactivation(sourceId, orderId, reason, auditContext);
-      if (!blocked) {
-        await replyMessage(event.replyToken,
-          `處理失敗：無法在資料庫保存 ${orderId} 的${action}狀態，請聯繫管理員查看 Render Logs。`);
-      } else if (found) {
-        await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
-      } else {
-        await replyMessage(event.replyToken,
-          `${orderId} 已標記為${action}；即使原訂單稍後再次送達，也不會加入簡表或月結。`);
+      // 單筆與批次均只使用一次 replyToken；各日期簡表合併回覆。
+      const reports = [];
+      if (orderIds.length > 1) reports.push(`批次${action}：完成 ${completed.length} 筆，失敗 ${failed.length} 筆。`);
+      if (completed.length && (orderIds.length > 1 || !affectedDates.size)) {
+        reports.push(`${completed.join('、')} 已標記為${action}，重貼原單不會重新加入簡表或月結。`);
       }
-      continue;
-    }
-
-    // ── 1. 取消：「XXX 訂單取消」或「XXX 取消」──
-    const cancelM = text.match(/([A-Z0-9]{6,15})\s*(訂單取消|取消)/);
-    if (cancelM) {
-      const orderId = cancelM[1];
-      const found = await findOrderDate(sourceId, orderId);
-      if (found) {
-        getDateOrders(sourceId, found.date, true)[found.key] = null;
-        setChanged(sourceId, found.date);
-        await markOrderCancelledInMongo(sourceId, found.date, found.key, '客服取消');
-        await blockOrderReactivation(sourceId, orderId, '客服取消', auditContext);
-        await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
-      } else {
-        await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有取消任何資料。`);
+      if (failed.length) reports.push(`處理失敗／尚未確認完成：${failed.join('、')}。請查詢簡表確認後重試。`);
+      for (const date of affectedDates) {
+        if (!TEST_MODE) { scheduleFlush(sourceId, date); continue; }
+        const orders = await refreshDateOrdersFromMongo(sourceId, date);
+        reports.push(buildSummary(sourceId, date, orders || {}) || `${date}（更新）\n目前無有效訂單\n結算價合計：0\n客收合計：0\n業績合計：0`);
       }
-      continue;
-    }
-
-    // ── 2. 拉回改派：「拉回改派 XXXX」→ 先移除，等新訂單進來 ──
-    const pullReassignM = text.match(/拉回改派\s*([A-Z0-9]{6,15})/);
-    if (pullReassignM) {
-      const orderId = pullReassignM[1];
-      const found = await findOrderDate(sourceId, orderId);
-      if (found) {
-        getDateOrders(sourceId, found.date, true)[found.key] = null;
-        setChanged(sourceId, found.date);
-        await markOrderCancelledInMongo(sourceId, found.date, found.key, '客服拉回改派');
-        await blockOrderReactivation(sourceId, orderId, '客服拉回改派', auditContext);
-        await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
-      } else {
-        await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有拉回或改派任何資料。`);
-      }
+      if (reports.length) await replyMessage(event.replyToken, reports.join('\n\n'));
       continue;
     }
 
     // ── 3. 改派：「XXX 改派」+ 新訂單內容 ──
-    const reassignM = text.match(/([A-Z0-9]{6,15})\s*改派/);
+    const reassignM = text.match(/^([A-Z0-9]{6,15})[ \t]*改派[ \t]*(?:\r?\n|$)/i);
     if (reassignM) {
       const oldId = reassignM[1];
       const newOrders = parseOrders(text);
@@ -1369,27 +1465,6 @@ app.post('/webhook', async (req, res) => {
       }
       const date = normalizeDate(newOrders[0]?.date);
       await sendOrScheduleSummary(event.replyToken, sourceId, date);
-      continue;
-    }
-
-    // ── 4. 拉回：「XXX 拉回」或「XXX ...拉回」或「我先拉回」──
-    const pullbackM = text.match(/([A-Z0-9]{6,15})[^\n]*拉回/) || text.match(/拉回/);
-    if (pullbackM) {
-      if (pullbackM[1]) {
-        const orderId = pullbackM[1];
-        const found = await findOrderDate(sourceId, orderId);
-        if (found) {
-          getDateOrders(sourceId, found.date, true)[found.key] = null;
-          setChanged(sourceId, found.date);
-          await markOrderCancelledInMongo(sourceId, found.date, found.key, '客服拉回');
-          await blockOrderReactivation(sourceId, orderId, '客服拉回', auditContext);
-          await sendOrScheduleSummary(event.replyToken, sourceId, found.date);
-        } else {
-          await replyMessage(event.replyToken, `找不到訂單 ${orderId}，沒有拉回任何資料。`);
-        }
-      } else {
-        await replyMessage(event.replyToken, '拉回停止：訊息中沒有訂單編號，請輸入「訂單編號 拉回」。');
-      }
       continue;
     }
 
@@ -1587,16 +1662,28 @@ function parseMonthlyExcelCommand(text) {
   return month >= 1 && month <= 12 ? month : -1;
 }
 
+function parseYearMonthCommand(text) {
+  const match = String(text).trim().match(/^月結\s*(\d{4})\s*(?:年|[\/-])\s*(\d{1,2})\s*月?\s*(?:(excel|xlsx))?$/i);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (year < 2020 || year > 2100 || month < 1 || month > 12) return { error: true };
+  return { year, month, excel: Boolean(match[3]) };
+}
+
 async function resolveGroupServiceDate(groupId, requestedDate = null, now = new Date()) {
   const businessNow = getBusinessDateParts(now);
+  const explicitYear = requestedDate && /^\d{4}[\/-]/.test(String(requestedDate))
+    ? extractServiceYear(requestedDate) : null;
   let date = requestedDate ? normalizeDate(requestedDate) : normalizeDate(lastActiveDate[groupId]);
-  let serviceYear = businessNow.year;
+  let serviceYear = explicitYear || businessNow.year;
   if (requestedDate && !date) return null;
 
   if (ordersCollection) {
     try {
       const filter = { groupId, cancelled: false };
       if (date) filter.date = date;
+      if (explicitYear) filter.serviceYear = explicitYear;
       const latest = await ordersCollection.find(filter).sort({ serviceYear: -1, updatedAt: -1 }).limit(1).toArray();
       if (latest[0]) {
         date = normalizeDate(latest[0].date) || date;
@@ -1628,7 +1715,8 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
   let date = requestedDate
     ? normalizeDate(requestedDate)
     : (lastActiveDate[groupId] ? normalizeDate(lastActiveDate[groupId]) : null);
-  let serviceYear = businessNow.year;
+  let serviceYear = requestedDate && /^\d{4}[\/-]/.test(String(requestedDate))
+    ? extractServiceYear(requestedDate) : businessNow.year;
   const groupCode = anonymizeId(groupId);
   const senderCode = anonymizeId(auditContext.senderId);
 
@@ -1687,7 +1775,7 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
     const performanceTotal = settlementTotal + customerCollectionTotal;
     const senderKeys = new Set(records.map(record => record.senderKey || '舊資料').filter(Boolean));
     const orderLines = activeOrders.slice(0, 25).map((record, index) => {
-      const location = record.type === '接' ? `接${record.loc || '?'}` : `${record.loc || '?'}送`;
+      const location = formatOrderLocation(record);
       const price = typeof record.price === 'number'
         ? fmtP(record.price)
         : (getCustomerCollectionTotal(record) > 0 ? '客收計價' : '待確認金額');
@@ -2492,6 +2580,16 @@ if (!IS_TEST_RUNTIME) {
   }, 13 * 60 * 1000);
 }
 
+// 統一處理 JSON 過大、壓縮內容或格式錯誤，避免回傳框架堆疊資訊。
+app.use((err, req, res, next) => {
+  if (!err) return next();
+  if (err.type === 'entity.too.large') return res.status(413).type('text/plain').send('Request too large');
+  if (err.type === 'encoding.unsupported') return res.status(415).type('text/plain').send('Compressed requests are not supported');
+  if (err instanceof SyntaxError) return res.status(400).type('text/plain').send('Invalid JSON');
+  console.error('HTTP 請求處理失敗:', err.message);
+  return res.status(400).type('text/plain').send('Bad request');
+});
+
 const PORT = process.env.PORT || 3000;
 if (!IS_TEST_RUNTIME) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
@@ -2501,6 +2599,9 @@ if (!IS_TEST_RUNTIME) {
 module.exports = {
   app,
   REGIONS_BY_CITY,
+  OFFICIAL_REGIONS,
+  compactLocation,
+  parseDispatchAction,
   parseAddr,
   parseAddrNoDefault,
   parseOrders,
@@ -2510,6 +2611,7 @@ module.exports = {
   toLineMessages,
   buildSummary,
   buildRequestedSummary,
+  buildCommandHelp,
   getOperationalRemarks,
   getSummaryLineRemarks,
   normalizeDate,
@@ -2518,6 +2620,7 @@ module.exports = {
   getTodayStr,
   parseMonthCommand,
   parseMonthlyExcelCommand,
+  parseYearMonthCommand,
   verifySignature,
   getDateOrders,
   setChanged,

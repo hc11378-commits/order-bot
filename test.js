@@ -7,6 +7,7 @@ process.env.TEST_MODE = 'true';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
 const axios = require('axios');
 const { unzipSync, strFromU8 } = require('fflate');
 const bot = require('./index');
@@ -274,6 +275,56 @@ test('月份指令解析範圍正確', () => {
   assert.equal(bot.parseMonthCommand('月結9'), 9);
   assert.equal(bot.parseMonthCommand('月結13月'), null);
   assert.equal(bot.parseMonthCommand('查月結'), null);
+});
+
+test('跨年度月結指令可指定年份、月份與 Excel', () => {
+  assert.deepEqual(bot.parseYearMonthCommand('月結 2025/12'), { year: 2025, month: 12, excel: false });
+  assert.deepEqual(bot.parseYearMonthCommand('月結 2025年12月 Excel'), { year: 2025, month: 12, excel: true });
+  assert.deepEqual(bot.parseYearMonthCommand('月結 2026-1 xlsx'), { year: 2026, month: 1, excel: true });
+  assert.deepEqual(bot.parseYearMonthCommand('月結 2026/13'), { error: true });
+  assert.equal(bot.parseYearMonthCommand('月結 12月'), null);
+});
+
+test('內建指令說明涵蓋簡表、診斷、月結 Excel 與訂單異動', () => {
+  const help = bot.buildCommandHelp();
+  assert.match(help, /版本 2.0.0-fused/);
+  assert.match(help, /簡表 10\/27/);
+  assert.match(help, /群組診斷/);
+  assert.match(help, /月結 Excel/);
+  assert.match(help, /月結 \d{4}\/10 Excel/);
+  assert.match(help, /ABC12345 收回/);
+  assert.match(help, /補12送/);
+});
+
+test('LINE 群組輸入「指令」會即時收到完整說明', async () => {
+  const originalPost = axios.post;
+  let replyText = '';
+  axios.post = async (_url, payload) => {
+    replyText = payload.messages.map(message => message.text).join('\n');
+    return { status: 200 };
+  };
+  const server = bot.app.listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  const { port } = server.address();
+  const body = JSON.stringify({ events: [{
+    type: 'message', replyToken: 'help-reply',
+    source: { type: 'group', groupId: 'help-group', userId: 'driver' },
+    message: { type: 'text', id: 'help-message', text: '指令' },
+  }] });
+  const signature = crypto.createHmac('sha256', process.env.LINE_CHANNEL_SECRET)
+    .update(Buffer.from(body)).digest('base64');
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-line-signature': signature }, body,
+    });
+    assert.equal(response.status, 200);
+    assert.match(replyText, /機場接送 Bot 指令/);
+    assert.match(replyText, /簡表/);
+    assert.match(replyText, /月結 Excel/);
+  } finally {
+    axios.post = originalPost;
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
 });
 
 test('不同 LINE 群組的同日訂單完全隔離', () => {
@@ -582,7 +633,7 @@ test('執行日9/8可明確診斷9/10預派單，且查詢不會離開當前群�
   assert.match(report, /執行時間：9\/8 18:00/);
   assert.match(report, /檢查服務日：9\/10/);
   assert.match(report, /服務日訂單：/);
-  assert.match(report, /新北市板橋區送/);
+  assert.match(report, /送新北板橋/);
 });
 
 test('群組診斷將結算價與客收分開，只有客收時業績不標示待確認', async () => {
@@ -693,7 +744,7 @@ test('webhook 可接收「群組診斷 9/10」並只回覆該群組的服務日�
     assert.equal(capturedQuery.groupId, 'diagnostic-command-group');
     assert.equal(capturedQuery.date, '9/10');
     assert.match(replyText, /檢查服務日：9\/10/);
-    assert.match(replyText, /接台北市北投區/);
+    assert.match(replyText, /接台北北投/);
   } finally {
     axios.post = originalPost;
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
@@ -706,7 +757,7 @@ test('匿名識別碼固定且不同群組不會相同', () => {
   assert.equal(bot.anonymizeId('group-A').length, 10);
 });
 
-test('單一 LINE 指令以同一流程修復已確認的 9/9 重複單與 9/11 漏單', async () => {
+test('已完成的一次性舊資料修復指令已退役且不再修改資料', async () => {
   const groupId = 'combined-legacy-repair-group';
   const makeRecord = (date, row) => ({
     _id: date.replace('/', '-') + '-' + row[0],
@@ -788,22 +839,15 @@ test('單一 LINE 指令以同一流程修復已確認的 9/9 重複單與 9/11 
   try {
     let response = await sendCommand('combined-repair-first');
     assert.equal(response.status, 200);
-    assert.match(replyText, /已確認舊資料修復完成/);
-    assert.match(replyText, /【9\/9 驗證】[\s\S]*MongoDB有效訂單：8 筆/);
-    assert.match(replyText, /【9\/9 驗證】[\s\S]*結算價總額：5933/);
-    assert.match(replyText, /【9\/9 驗證】[\s\S]*客收總額：1100/);
-    assert.match(replyText, /【9\/9 驗證】[\s\S]*業績總額：7033/);
-    assert.match(replyText, /【9\/11 驗證】[\s\S]*MongoDB有效訂單：7 筆/);
-    assert.match(replyText, /【9\/11 驗證】[\s\S]*結算價總額：4473/);
-    assert.match(replyText, /【9\/11 驗證】[\s\S]*客收總額：900/);
-    assert.match(replyText, /【9\/11 驗證】[\s\S]*業績總額：5373/);
-    assert.equal(records.filter(record => record.date === '9/9' && !record.cancelled).length, 8);
+    assert.match(replyText, /已完成並退役/);
+    assert.match(replyText, /沒有修改任何資料/);
+    assert.equal(records.filter(record => record.date === '9/9' && !record.cancelled).length, 9);
     assert.equal(records.filter(record => record.date === '9/11' && !record.cancelled).length, 7);
 
     response = await sendCommand('combined-repair-second');
     assert.equal(response.status, 200);
-    assert.match(replyText, /先前已修復，沒有重複修改/);
-    assert.equal(records.filter(record => record.date === '9/9' && !record.cancelled).length, 8);
+    assert.match(replyText, /已完成並退役/);
+    assert.equal(records.filter(record => record.date === '9/9' && !record.cancelled).length, 9);
     assert.equal(records.filter(record => record.date === '9/11' && !record.cancelled).length, 7);
   } finally {
     axios.post = originalPost;
@@ -869,8 +913,8 @@ test('9/11 舊資料修復精準交換收回單與自客單，重跑不重複且
     assert.match(first, /結算價總額：4473/);
     assert.match(first, /客收總額：900/);
     assert.match(first, /業績總額：5373/);
-    assert.match(first, /04:20，新北市中和區送，客收計價，客收900/);
-    assert.doesNotMatch(first, /\d+。04:50，新北市中和區送，978/);
+    assert.match(first, /04:20，送新北中和，客收計價，客收900/);
+    assert.doesNotMatch(first, /\d+。04:50，送新北中和，978/);
 
     const active = records.filter(record => record.groupId === groupId && !record.cancelled);
     assert.equal(active.length, 7);
@@ -905,7 +949,8 @@ test('9/11 舊資料修復精準交換收回單與自客單，重跑不重複且
         body,
       });
       assert.equal(response.status, 200);
-      assert.match(replyText, /已修復，沒有重複修改/);
+      assert.match(replyText, /已完成並退役/);
+      assert.match(replyText, /沒有修改任何資料/);
     } finally {
       axios.post = originalPost;
       await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
@@ -1016,6 +1061,7 @@ test('HTTP 健康檢查與 webhook 簽章防護正常', async () => {
   try {
     const health = await fetch(`http://127.0.0.1:${port}/health`);
     assert.equal(health.status, 200);
+    assert.equal(health.headers.get('x-powered-by'), null);
     assert.equal((await health.json()).databaseReady, true);
 
     const invalid = await fetch(`http://127.0.0.1:${port}/webhook`, {
@@ -1032,6 +1078,26 @@ test('HTTP 健康檢查與 webhook 簽章防護正常', async () => {
       body,
     });
     assert.equal(valid.status, 200);
+
+    const invalidJson = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{bad json',
+    });
+    assert.equal(invalidJson.status, 400);
+    assert.equal(await invalidJson.text(), 'Invalid JSON');
+
+    const compressedBody = zlib.gzipSync(Buffer.from('{"events":[]}'));
+    const compressed = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      body: compressedBody,
+    });
+    assert.equal(compressed.status, 415);
+
+    const largeBody = JSON.stringify({ events: [], padding: 'x'.repeat(513 * 1024) });
+    const oversized = await fetch(`http://127.0.0.1:${port}/webhook`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: largeBody,
+    });
+    assert.equal(oversized.status, 413);
   } finally {
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
   }
@@ -1081,7 +1147,7 @@ test('完整 webhook 流程可接單、寫入 MongoDB 並用 Reply API 回覆', 
     assert.equal(mongoWrite.update.$set.conversationType, 'group');
     assert.equal(mongoWrite.update.$set.senderKey.length, 10);
     assert.match(lineReply.url, /message\/reply$/);
-    assert.match(lineReply.payload.messages[0].text, /接新北市土城區/);
+    assert.match(lineReply.payload.messages[0].text, /接新北土城/);
   } finally {
     axios.post = originalPost;
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
@@ -1157,7 +1223,7 @@ test('重啟後只補貼 CUG338169 一次，Bot 即從 MongoDB 同步完整九�
     assert.equal(records.filter(record => !record.cancelled).length, 9);
     assert.match(replyText, /1。00:10/);
     assert.match(replyText, /3。05:00/);
-    assert.match(replyText, /4。05:40，接台北市中山區/);
+    assert.match(replyText, /4。05:40，接台北中山/);
     assert.match(replyText, /9。16:00/);
     assert.match(replyText, /結算價合計：6253/);
     assert.match(replyText, /客收合計：0/);
@@ -1227,7 +1293,7 @@ test('重啟後只補貼發哥單一次，Bot 即回覆完整八趟、已確認5
     });
     assert.equal(response.status, 200);
     assert.equal(records.filter(record => !record.cancelled).length, 8);
-    assert.match(replyText, /8。19:00，接新北市板橋區/);
+    assert.match(replyText, /8。19:00，接新北板橋/);
     assert.match(replyText, /客收計價/);
     assert.match(replyText, /結算價合計：5206/);
     assert.match(replyText, /客收合計：1100/);
@@ -1294,7 +1360,7 @@ test('無標題自客單可經完整 webhook 寫入，客收直接列為業績�
     assert.equal(records[0].loc, '新北市中和區');
     assert.equal(records[0].price, null);
     assert.deepEqual(records[0].remarks, ['客收900']);
-    assert.match(replyText, /1。04:20，新北市中和區送/);
+    assert.match(replyText, /1。04:20，送新北中和/);
     assert.match(replyText, /客收計價/);
     assert.match(replyText, /結算價合計：0/);
     assert.match(replyText, /客收合計：900/);
@@ -1810,7 +1876,8 @@ test('月結 Excel 下載憑證會加密群組、限制期限並拒絕竄改', (
     v: 1, groupId: 'private-driver-group', year: 2026, month: 9,
     exp: issuedAt + 24 * 60 * 60 * 1000,
   });
-  const changed = `${token.slice(0, -1)}${token.endsWith('A') ? 'B' : 'A'}`;
+  const tamperIndex = Math.floor(token.length / 2);
+  const changed = `${token.slice(0, tamperIndex)}${token[tamperIndex] === 'A' ? 'B' : 'A'}${token.slice(tamperIndex + 1)}`;
   assert.equal(bot.verifyMonthlyExcelToken(changed, issuedAt + 1000), null);
   assert.equal(bot.verifyMonthlyExcelToken(token, issuedAt + 24 * 60 * 60 * 1000 + 1), null);
 });
@@ -1885,13 +1952,41 @@ test('「簡表 日期」會從 MongoDB 讀取該群組並立即回覆指定格�
     assert.equal(response.status, 200);
     assert.ok(captured.every(query => query.groupId === 'manual-summary-group'));
     assert.match(replyText, /^9\/10（更新）/);
-    assert.match(replyText, /1。03:00，新北市三重區送，1人，645/);
+    assert.match(replyText, /1。03:00，送新北三重，1人，645/);
     assert.doesNotMatch(replyText, /禁煙/);
     assert.match(replyText, /結算價合計：645/);
   } finally {
     axios.post = originalPost;
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
   }
+});
+
+test('簡表與群組診斷可指定完整年份，不會混入其他年度同月同日訂單', async () => {
+  const records = [
+    { groupId: 'history-group', serviceYear: 2025, date: '12/31', key: 'OLD', time: '08:00', type: '送', loc: '台北市中正區', pax: 1, price: 700, remarks: [], cancelled: false, updatedAt: new Date('2025-12-31T01:00:00Z') },
+    { groupId: 'history-group', serviceYear: 2026, date: '12/31', key: 'NEW', time: '09:00', type: '接', loc: '新北市板橋區', pax: 2, price: 900, remarks: [], cancelled: false, updatedAt: new Date('2026-12-31T01:00:00Z') },
+  ];
+  const queries = [];
+  bot.__setOrdersCollectionForTests({
+    find(query) {
+      queries.push(query);
+      const matched = records.filter(record => record.groupId === query.groupId &&
+        record.cancelled === query.cancelled && (!query.date || record.date === query.date) &&
+        (!query.serviceYear || record.serviceYear === query.serviceYear));
+      return { sort() { return this; }, limit() { return this; }, async toArray() { return matched; } };
+    },
+  });
+  const summary = await bot.buildRequestedSummary('history-group', '2025/12/31', new Date('2026-10-27T04:00:00Z'));
+  const diagnostic = await bot.buildGroupDiagnostic(
+    'history-group', { senderId: 'driver', conversationType: 'group' },
+    new Date('2026-10-27T04:00:00Z'), '2025/12/31'
+  );
+  assert.match(summary, /送台北中正/);
+  assert.match(summary, /結算價合計：700/);
+  assert.doesNotMatch(summary, /新北市板橋區|900/);
+  assert.match(diagnostic, /送台北中正/);
+  assert.match(diagnostic, /結算價總額：700/);
+  assert.ok(queries.every(query => !query.serviceYear || query.serviceYear === 2025));
 });
 
 test('LINE 月結 Excel 指令產生可點擊下載連結，端點回傳有效且僅限該群組的 xlsx', async () => {
@@ -1955,3 +2050,156 @@ test('LINE 月結 Excel 指令產生可點擊下載連結，端點回傳有效�
     await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
   }
 });
+
+// ── 全台行政區與彈性單筆異動測試 ──
+for (const [city, districts] of Object.entries(bot.OFFICIAL_REGIONS)) {
+  test(`${city} 所有行政區均可解析且使用短格式`, () => {
+    for (const district of districts) {
+      const full = city + district;
+      assert.equal(bot.parseAddr(full + '測試路1號'), full);
+      assert.equal(bot.compactLocation(full), city.slice(0, -1) + district.slice(0, -1));
+      for (const type of ['接', '送']) {
+        const summary = bot.buildSummary('all-regions', '10/29', { one: { time:'09:00',type,loc:full,pax:2,price:691,remarks:[] } });
+        assert.ok(summary.includes(`${type}${city.slice(0,-1)}${district.slice(0,-1)}`));
+      }
+    }
+  });
+}
+
+test('官方離線清單與原行政區資料涵蓋相同的368區', () => {
+  assert.equal(Object.keys(bot.OFFICIAL_REGIONS).length, 22);
+  assert.equal(Object.values(bot.OFFICIAL_REGIONS).flat().length,368);
+  for (const [city, districts] of Object.entries(bot.OFFICIAL_REGIONS)) {
+    const key = ['新竹市','新竹縣','嘉義市','嘉義縣'].includes(city) ? city : city.slice(0,-1);
+    assert.deepEqual(districts.map(d=>d.slice(0,-1)).sort(), [...bot.REGIONS_BY_CITY[key]].sort());
+  }
+});
+
+test('大同區與大同鄉不再混淆，真正同名的信義區仍待確認', () => {
+  assert.equal(bot.parseAddr('大同區承德路'),'台北市大同區');
+  assert.equal(bot.parseAddr('大同鄉復興村'),'宜蘭縣大同鄉');
+  assert.equal(bot.parseAddr('信義區松仁路'),'縣市待確認：信義區');
+  assert.equal(bot.compactLocation('縣市待確認：大同區'),'台北大同');
+  assert.equal(bot.compactLocation('縣市待確認：信義區'),'縣市待確認：信義區');
+  assert.equal(bot.compactLocation('新北市板橋區→台南市新市區'),'新北板橋→台南新市');
+});
+
+const commands = [
+ ['取消 ABC12345','取消'], ['ABC12345 訂單取消','取消'], ['訂單編號：ABC12345\n取消','取消'],
+ ['請幫我取消訂單 ABC12345，謝謝','取消'], ['拉回 ABC12345','拉回'],
+ ['ABC12345\n這筆先拉回，謝謝','拉回'], ['ABC12345 + 拉回改派','拉回改派'],
+ ['拉回改派：ABC12345','拉回改派'], ['ＡＢＣ１２３４５＋取消','取消'],
+ ['abc12345，取消','取消'], ['【ABC12345】\n拉回 改派','拉回改派'],
+ ['ABC12345 改派','改派'], ['收回 ABC12345','收回'],
+];
+for (const [text,action] of commands) {
+  test(`指令辨識 ${JSON.stringify(text)}`,()=>assert.deepEqual(bot.parseDispatchAction(text),{orderId:'ABC12345',action}));
+}
+for (const text of ['ABC12345 不要取消','ABC12345 尚未取消','ABC12345 是否取消？','航班取消 ABC12345','其他備註：ABC12345 取消費200','其他備註：拉回 ABC12345']) {
+  test(`不執行非指令 ${JSON.stringify(text)}`,()=>assert.equal(bot.parseDispatchAction(text),null));
+}
+for (const text of ['取消','取消 XABC1234567890123456']) {
+  test(`缺少或不明編號不猜測 ${text}`,()=>assert.ok(bot.parseDispatchAction(text).error));
+}
+
+test('用戶10/29範例短格式及金額保持正確',()=>{
+  const rows=[['09:00','接','台北市南港區',2,691,[]],['12:10','送','台北市內湖區',2,530,[]],['12:25','接','縣市待確認：大同區',3,791,['舉牌']],['15:20','接','縣市待確認：信義區',3,791,['舉牌']],['18:30','送','台北市萬華區',2,600,[]],['19:00','接','新北市板橋區',1,819,[]]];
+  const orders=Object.fromEntries(rows.map(([time,type,loc,pax,price,remarks],i)=>[i,{time,type,loc,pax,price,remarks}]));
+  orders.p15={isPlaceholder:true,time:'15:00',display:'補15送'};
+  orders.p22={isPlaceholder:true,time:'22:00',display:'補22送'};
+  const summary=bot.buildSummary('example','10/29',orders,{forceUpdated:true});
+  assert.match(summary,/1。09:00，接台北南港/);
+  assert.match(summary,/2。12:10，送台北內湖/);
+  assert.match(summary,/3。12:25，接台北大同/);
+  assert.match(summary,/7。19:00，接新北板橋/);
+  assert.match(summary,/結算價合計：4222/);
+  assert.match(summary,/舉牌\*2/);
+});
+
+async function exercise(text, fail=false, shouldCancel=true) {
+  const groupId='new-dispatch-'+text;
+  const record={groupId,key:'ABC12345',orderId:'ABC12345',serviceYear:2026,date:'10/29',time:'09:00',type:'接',loc:'新北市板橋區',pax:1,price:819,remarks:[],cancelled:false};
+  const other={...record,groupId:'other-group'};
+  let blocked=false;
+  bot.getDateOrders(groupId,'10/29',true).ABC12345=record;
+  bot.__setOrdersCollectionForTests({
+    async findOne(query){return query.groupId===groupId && !record.cancelled ? record : null;},
+    async updateMany(query,update){if(fail)throw Error('simulated failure');assert.equal(query.groupId,groupId);Object.assign(record,update.$set);return {matchedCount:1};},
+    async updateOne(query,update){if(fail)throw Error('simulated failure');assert.equal(query.groupId,groupId);if(query.suppressionOnly)blocked=true;else Object.assign(record,update.$set);},
+    find(query){return {sort(){return this;},async toArray(){return query.groupId===groupId && !record.cancelled ? [record] : [];}};},
+  });
+  const original=axios.post;let reply='';
+  axios.post=async(_url,payload)=>{reply=payload.messages.map(m=>m.text).join('\n');};
+  const server=bot.app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
+  try{
+    const body=JSON.stringify({events:[{type:'message',replyToken:'test-reply',source:{type:'group',groupId,userId:'dispatcher'},message:{type:'text',id:'command-message',text}}]});
+    const signature=crypto.createHmac('sha256',process.env.LINE_CHANNEL_SECRET).update(body).digest('base64');
+    const response=await fetch(`http://127.0.0.1:${server.address().port}/webhook`,{method:'POST',body,headers:{'content-type':'application/json','x-line-signature':signature}});
+    assert.equal(response.status,200);
+    assert.equal(other.cancelled,false);
+    if(!shouldCancel){assert.equal(record.cancelled,false);assert.equal(blocked,false);assert.ok(bot.getDateOrders(groupId,'10/29').ABC12345);}
+    else if(fail){assert.match(reply,/失敗/);assert.equal(record.cancelled,false);assert.ok(bot.getDateOrders(groupId,'10/29').ABC12345);}
+    else {assert.equal(record.cancelled,true);assert.equal(blocked,true);assert.match(reply,/目前無有效訂單/);assert.equal(bot.getDateOrders(groupId,'10/29').ABC12345,undefined);}
+  }finally{axios.post=original;bot.__setOrdersCollectionForTests(null);await new Promise(resolve=>server.close(resolve));}
+}
+for(const [text] of commands)test(`Webhook 實際取消且不影響其他群組 ${JSON.stringify(text)}`,()=>exercise(text));
+test('取消寫入失敗不清除快取也不回覆成功',()=>exercise('取消 ABC12345',true));
+
+for(const text of ['ABC12345 不要取消','取消','其他備註：ABC12345 拉回']) test(`Webhook 不誤刪 ${text}`,()=>exercise(text,false,false));
+
+// ── 批次拉回／取消／改派測試 ──
+const ids=['XJQ798147','ZUF777274','SCC907815'];
+for(const action of ['拉回','取消','改派','拉回改派','收回']){
+  for(const text of [ids.join('\n')+'\n\n以上'+action,action+'：'+ids.join('、')]){
+    test(`批次解析 ${JSON.stringify(text)}`,()=>assert.deepEqual(bot.parseDispatchAction(text),{action,orderIds:ids}));
+  }
+}
+test('大小寫、全形與重複編號去重',()=>assert.deepEqual(bot.parseDispatchAction('xjq798147\nＺＵＦ７７７２７４\nXJQ798147\n以上取消'),{action:'取消',orderIds:ids.slice(0,2)}));
+test('同則訊息明確保留的編號不套用批次動作',()=>assert.deepEqual(bot.parseDispatchAction(ids.join('\n')+'\nXJQ798147 不要取消\n以上取消'),{action:'取消',orderIds:ids.slice(1)}));
+test('一百筆編號沒有固定筆數截斷',()=>assert.equal(bot.parseDispatchAction(Array.from({length:100},(_,i)=>`TEST${String(i).padStart(6,'0')}`).join('\n')+'\n以上拉回').orderIds.length,100));
+
+function matches(record,query){return Object.entries(query).every(([key,value])=>key==='$or'?value.some(item=>matches(record,item)):record[key]===value);}
+async function checkBatch(action,{failure=false,unknown=false,count=3}={}){
+ const groupId=`batch-${action}-${failure}-${unknown}-${count}`;
+ const orderIds=count===3?ids:Array.from({length:count},(_,i)=>`TEST${String(i).padStart(6,'0')}`);
+ const records=orderIds.map((id,i)=>({groupId,key:id,orderId:id,date:i%2?'10/30':'10/29',serviceYear:2026,cancelled:false,time:'09:00',type:'接',loc:'新北市板橋區',pax:1,price:700,remarks:[]}));
+ const other={...records[0],groupId:'other-group'};records.push(other);
+ // 保留未列在指令中的單，不可一併取消。
+ const untouched={...records[0],key:'KEEP99999',orderId:'KEEP99999'};records.push(untouched);
+ bot.__setOrdersCollectionForTests({
+  async findOne(query){return records.find(r=>matches(r,query))||null;},
+  find(query){const found=records.filter(r=>matches(r,query));return {sort(){return this;},async toArray(){return found.map(r=>({...r}));}};},
+  async updateMany(query,update){if(failure&&query.key===ids[1])throw Error('simulated batch failure');const found=records.filter(r=>matches(r,query));found.forEach(r=>Object.assign(r,update.$set));return {matchedCount:found.length};},
+  async updateOne(query,update,options={}){if(failure&&query.key===ids[1])throw Error('simulated batch failure');let record=records.find(r=>matches(r,query));if(!record&&options.upsert){record={};records.push(record);}if(record)Object.assign(record,update.$set);return {acknowledged:true};},
+ });
+ const original=axios.post;const replies=[];
+ axios.post=async(url,payload)=>{assert.match(url,/\/reply$/);replies.push(payload.messages.map(m=>m.text).join('\n'));};
+ const server=bot.app.listen(0,'127.0.0.1');await new Promise(resolve=>server.once('listening',resolve));
+ const post=async()=>{
+  const requested=unknown?[...orderIds,'UNKNOWN01']:orderIds;
+  const text=requested.join('\n')+'\n\n以上'+action;
+  const body=JSON.stringify({events:[{type:'message',replyToken:'batch-reply',source:{type:'group',groupId,userId:'test-user'},message:{type:'text',id:'batch-message',text}}]});
+  const signature=crypto.createHmac('sha256',process.env.LINE_CHANNEL_SECRET).update(body).digest('base64');
+  const response=await fetch(`http://127.0.0.1:${server.address().port}/webhook`,{method:'POST',body,headers:{'content-type':'application/json','x-line-signature':signature}});assert.equal(response.status,200);
+ };
+ try{
+  await post();assert.equal(replies.length,1);assert.equal(other.cancelled,false);assert.equal(untouched.cancelled,false);
+  for(const id of orderIds){const record=records.find(r=>r.groupId===groupId&&r.key===id&&!r.suppressionOnly);assert.equal(record.cancelled,!(failure&&id===ids[1]));}
+  const expected=count+(unknown?1:0)-(failure?1:0);
+  assert.ok(replies[0].includes(`完成 ${expected} 筆，失敗 ${failure?1:0} 筆`));
+  assert.match(replies[0],/10\/29（更新）/);
+  if(!failure)assert.match(replies[0],/10\/30（更新）/);
+  if(failure){assert.match(replies[0],/尚未確認完成：ZUF777274/);assert.equal(records.filter(r=>r.groupId===groupId&&r.key===ids[1]&&r.suppressionOnly).length,0);}
+  if(unknown)assert.ok(records.some(r=>r.groupId===groupId&&r.key==='UNKNOWN01'&&r.suppressionOnly&&r.preventReactivation));
+  for(const id of orderIds){
+   if(failure&&id===ids[1])continue;
+   assert.equal(await bot.saveOrderToMongo(groupId,'10/29',id,{orderId:id,date:'2026/10/29',time:'09:00',type:'接',loc:'新北市板橋區',price:700,pax:1,remarks:[]}), 'suppressed');
+  }
+  // 重送同則批次：不新增重複的封鎖紀錄。
+  const size=records.length;await post();assert.equal(records.length,size);assert.equal(replies.length,2);
+ }finally{axios.post=original;bot.__setOrdersCollectionForTests(null);await new Promise(resolve=>server.close(resolve));}
+}
+for(const action of ['拉回','取消','改派','拉回改派'])test(`Webhook 批次${action}跨日期、群組隔離及重送`,()=>checkBatch(action));
+test('部分訂單失敗仍處理其他訂單，明確列出失敗編號',()=>checkBatch('取消',{failure:true}));
+test('尚未貼入的訂單先建立封鎖，防止稍後復活',()=>checkBatch('拉回',{unknown:true}));
+test('一次100筆均取消，不只處理第一筆',()=>checkBatch('取消',{count:100}));
