@@ -3,6 +3,7 @@ process.env.LINE_CHANNEL_SECRET = 'automated-test-secret';
 process.env.LINE_CHANNEL_ACCESS_TOKEN = 'automated-test-token';
 process.env.MONGO_URI = 'mongodb://not-used-during-tests';
 process.env.TEST_MODE = 'true';
+process.env.UNSEND_AUTO_PUSH = 'false';
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -287,7 +288,7 @@ test('跨年度月結指令可指定年份、月份與 Excel', () => {
 
 test('內建指令說明涵蓋簡表、診斷、月結 Excel 與訂單異動', () => {
   const help = bot.buildCommandHelp();
-  assert.match(help, /版本 2.0.0-fused/);
+  assert.match(help, /版本 2\.1\.0-fused/);
   assert.match(help, /簡表 10\/27/);
   assert.match(help, /群組診斷/);
   assert.match(help, /月結 Excel/);
@@ -1577,7 +1578,7 @@ test('無編號自客單收回後重貼修改版只保留一筆有效訂單', as
   }
 });
 
-test('編號加拉回改派、改派或收回後均永久排除，重貼也不回到簡表與月結', async () => {
+test('編號撤回後，LINE舊事件重送不回到簡表與月結', async () => {
   const commands = [
     ['withdraw-lock-group-1', 'LOCK0001', 'LOCK0001 拉回改派'],
     ['withdraw-lock-group-2', 'LOCK0002', 'LOCK0002 改派'],
@@ -1667,7 +1668,7 @@ test('編號加拉回改派、改派或收回後均永久排除，重貼也不�
         '其他備註：', '聯絡人：測試客戶', '電話：0900000000', '結算價：700',
       ].join('\n');
       response = await postWebhook([{
-        type: 'message', replyToken: 'repost-reply-' + orderId,
+        type: 'message', replyToken: 'repost-reply-' + orderId, deliveryContext: { isRedelivery: true },
         source: { type: 'group', groupId, userId: 'dispatcher-user' },
         message: { type: 'text', id: 'repost-message-' + orderId, text: repostText },
       }]);

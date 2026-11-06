@@ -1,11 +1,11 @@
 {
   "name": "order-summary-bot",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test.js",
-    "check": "node --check index.js && node --check test.js"
+    "test": "node --test test.js unsend.test.js fixes.test.js",
+    "check": "node --check index.js && node --check test.js && node --check unsend.test.js && node --check fixes.test.js"
   },
   "engines": {
     "node": ">=20 <23"

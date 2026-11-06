@@ -12,9 +12,11 @@ const CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET?.trim();
 const CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN?.trim();
 const MONGO_URI = process.env.MONGO_URI?.trim(); // MongoDB Atlas 連線字串僅存在 Render 環境變數
 const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
+// 收回事件沒有 replyToken；自動通知需使用 Push，獨立於一般接單測試模式。
+const UNSEND_AUTO_PUSH = process.env.UNSEND_AUTO_PUSH?.trim().toLowerCase() !== 'false';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '2.0.0-fused';
+const BOT_VERSION = '2.1.0-fused';
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -118,16 +120,21 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
     const canonicalDate = normalizeDate(date);
     if (!canonicalDate) throw new Error(`無效的服務日期：${date}`);
     const serviceYear = extractServiceYear(order.date);
-    // 已由客服明確取消、拉回、改派或收回的訂單，留下永久封鎖標記。
-    // 即使 LINE 重送舊 webhook 或有人再次貼上原單，也不能把 cancelled 改回 false。
+    const messageId = String(audit.messageId || order.lineMessageId || '');
+    let supersededMessageIds = [];
     if (typeof ordersCollection.findOne === 'function') {
-      const suppression = await ordersCollection.findOne({
-        groupId,
-        key,
-        cancelled: true,
-        preventReactivation: true,
-      });
-      if (suppression) return 'suppressed';
+      const existing = await ordersCollection.findOne({ groupId, key, serviceYear, date: canonicalDate });
+      const suppression = await ordersCollection.findOne({ groupId, key, cancelled: true, preventReactivation: true });
+      supersededMessageIds = [...new Set(existing?.supersededMessageIds || [])];
+      if (messageId && supersededMessageIds.includes(messageId)) return 'suppressed';
+      if (audit.eventTimestamp && existing?.lastEventTimestamp && audit.eventTimestamp < existing.lastEventTimestamp) return 'suppressed';
+      if (suppression) {
+        const cutoff = Number(suppression.lastCancellationTimestamp) || 0;
+        if (!messageId || audit.isRedelivery || suppression.lineMessageId === messageId ||
+            (audit.eventTimestamp && cutoff && audit.eventTimestamp <= cutoff)) return 'suppressed';
+        if (suppression.lineMessageId) supersededMessageIds.push(suppression.lineMessageId);
+      }
+      if (existing?.lineMessageId && existing.lineMessageId !== messageId) supersededMessageIds.push(existing.lineMessageId);
     }
     await ordersCollection.updateOne(
       { groupId, serviceYear, date: canonicalDate, key },
@@ -141,6 +148,10 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
         ...(audit.conversationType ? { conversationType: audit.conversationType } : {}),
         ...(audit.messageId ? { lineMessageId: String(audit.messageId) } : {}),
         cancelled: false,
+        preventReactivation: false,
+        unsendNotificationPending: false,
+        supersededMessageIds: [...new Set(supersededMessageIds)],
+        ...(audit.eventTimestamp ? { lastEventTimestamp: audit.eventTimestamp } : {}),
         updatedAt: new Date(),
       } },
       { upsert: true }
@@ -170,13 +181,14 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
 }
 
 // 標記一筆訂單為已取消（月結統計時會排除）
-async function markOrderCancelledInMongo(groupId, date, key, reason = '訂單已取消') {
+async function markOrderCancelledInMongo(groupId, date, key, reason = '訂單已取消', eventTimestamp = null) {
   if (!ordersCollection) return false;
   try {
     const filter = { groupId, key, cancelled: false };
     const update = { $set: {
       cancelled: true,
       cancellationReason: reason,
+      ...(eventTimestamp ? { lastCancellationTimestamp: eventTimestamp } : {}),
       preventReactivation: true,
       updatedAt: new Date(),
     } };
@@ -209,6 +221,7 @@ async function blockOrderReactivation(groupId, key, reason, audit = {}) {
         cancelled: true,
         preventReactivation: true,
         cancellationReason: reason,
+        ...(audit.eventTimestamp ? { lastCancellationTimestamp: audit.eventTimestamp } : {}),
         ...(audit.senderId ? { senderKey: anonymizeId(audit.senderId) } : {}),
         ...(audit.conversationType ? { conversationType: audit.conversationType } : {}),
         updatedAt: new Date(),
@@ -250,7 +263,7 @@ function getDateOrders(groupId, date, create = false) {
 
 // Render 重啟後記憶體會清空。每次產生簡表前，從 MongoDB 重新載入
 // 「目前群組 + 目前服務日」的全部訂單，不可只顯示重啟後新貼的那一筆。
-async function refreshDateOrdersFromMongo(groupId, date, serviceYear = getBusinessDateParts().year) {
+async function refreshDateOrdersFromMongo(groupId, date, serviceYear = getBusinessDateParts().year, strict = false) {
   const current = getDateOrders(groupId, date, true);
   if (!ordersCollection) return current;
   try {
@@ -269,12 +282,13 @@ async function refreshDateOrdersFromMongo(groupId, date, serviceYear = getBusine
     }
     // 補單占位與交通車通知不寫 MongoDB，同步時仍需保留。
     for (const [key, order] of Object.entries(current)) {
-      if (order?.isPlaceholder || order?.isShuttle) refreshed[key] = order;
+      if ((order?.isPlaceholder && !order.persistedPlaceholder) || order?.isShuttle) refreshed[key] = order;
     }
     dailyOrders[groupId][date] = refreshed;
     return refreshed;
   } catch (err) {
     console.error('MongoDB 完整簡表同步失敗:', err.message);
+    if (strict) throw err;
     return current;
   }
 }
@@ -284,6 +298,7 @@ async function refreshDateOrdersFromMongo(groupId, date, serviceYear = getBusine
 async function handleLineUnsend(groupId, messageId) {
   if (!groupId || !messageId) return [];
   const affectedDates = new Set();
+  if (!ordersCollection) throw new Error('收回訂單失敗：資料庫未連線');
 
   if (ordersCollection) {
     try {
@@ -304,6 +319,7 @@ async function handleLineUnsend(groupId, messageId) {
         }, { $set: {
           cancelled: true,
           cancellationReason: 'LINE訊息已收回',
+          unsendNotificationPending: UNSEND_AUTO_PUSH,
           preventReactivation: true,
           unsentAt: new Date(),
           updatedAt: new Date(),
@@ -311,7 +327,7 @@ async function handleLineUnsend(groupId, messageId) {
       }
     } catch (err) {
       console.error('LINE 收回訊息處理失敗:', err.message);
-      return [];
+      throw err;
     }
   }
 
@@ -326,9 +342,41 @@ async function handleLineUnsend(groupId, messageId) {
   }
   for (const date of affectedDates) {
     setChanged(groupId, date);
-    if (!TEST_MODE) scheduleFlush(groupId, date);
+    // 收回通知由 webhook 立即送出，不等待一般接單的五分鐘排程。
   }
   return [...affectedDates];
+}
+
+// 取消與待通知狀態一同存入資料庫；即使重啟或 LINE 重送也能接續通知。
+async function notifyLineUnsend(groupId, messageId) {
+  if (!UNSEND_AUTO_PUSH || !messageId) return;
+  if (!ordersCollection) throw new Error('收回通知失敗：資料庫未連線');
+  const filter = { groupId, lineMessageId: String(messageId), cancelled: true, unsendNotificationPending: true };
+  const pending = await ordersCollection.find(filter).toArray();
+  const scopes = new Map();
+  for (const record of pending) {
+    const year = record.serviceYear || getBusinessDateParts().year;
+    const date = normalizeDate(`${year}/${record.date}`);
+    if (!date) throw new Error('收回通知的服務日期無效');
+    scopes.set(`${year}/${date}`, { year, date });
+  }
+  for (const [scope, { year, date }] of scopes) {
+    const orders = await refreshDateOrdersFromMongo(groupId, date, year, true);
+    const label = year === getBusinessDateParts().year ? date : scope;
+    const summary = buildSummary(groupId, label, orders, { forceUpdated: true }) || `${label}（更新）\n目前無有效訂單\n結算價合計：0\n客收合計：0\n業績合計：0`;
+    const hash = crypto.createHash('sha256').update(JSON.stringify([groupId, String(messageId), scope])).digest('hex');
+    const retryKey = `${hash.slice(0,8)}-${hash.slice(8,12)}-4${hash.slice(13,16)}-8${hash.slice(17,20)}-${hash.slice(20,32)}`;
+    try {
+      await pushMessage(groupId, summary, retryKey);
+    } catch (err) {
+      // 只有 LINE 明確表示同一 retry key 已接受時，才視為先前已成功。
+      if (!(err.response?.status === 409 && err.response?.headers?.['x-line-accepted-request-id'])) throw err;
+    }
+    await ordersCollection.updateMany({ ...filter, serviceYear: year, date },
+      { $set: { unsendNotificationPending: false, unsendNotifiedAt: new Date() } });
+    const timerKey = groupId + '|' + date;
+    if (pendingTimers[timerKey]) { clearTimeout(pendingTimers[timerKey]); delete pendingTimers[timerKey]; }
+  }
 }
 
 function setChanged(groupId, date) {
@@ -551,7 +599,15 @@ function parseDispatchAction(rawText) {
 function parseAddr(addr) {
   if (!addr || addr.match(/^桃園機場|^桃機|^機場|^松山機場/i)) return null;
   const normalized = addr.replace(/臺/g, '台');
-  const cityMatch = getCityMatch(normalized);
+  let cityMatch = getCityMatch(normalized);
+  if (!cityMatch) {
+    for (const prefix of ['新竹', '嘉義']) {
+      if (!normalized.includes(prefix)) continue;
+      const rest = normalized.slice(normalized.indexOf(prefix) + prefix.length);
+      const candidates = [prefix + '市', prefix + '縣'].filter(city => findRegionInCity(rest, city));
+      if (candidates.length === 1) { cityMatch = { city: candidates[0], alias: prefix }; break; }
+    }
+  }
   if (cityMatch) {
     const { city, alias } = cityMatch;
     // 先移除縣市名稱再找行政區，避免「桃園市蘆竹區」把前面的桃園市
@@ -889,7 +945,14 @@ function extractPriceV2(block) {
   return null;
 }
 
+function normalizeOrderText(text) {
+  return String(text).replace(/\r\n/g, '\n')
+    .replace(/[ \t]+(?=(?:出發日期|乘車人數|行李數量|航班編號|上車地點|中間點|下車地點|其他備註|聯絡人|電話|手機|結算價|結單價|司機資料)[：:])/g, '\n')
+    .replace(/((?:接機|送機)(?:-[A-Z])?)[ \t]+([A-Z0-9]{6,15})(?=[ \t]*\n|[ \t]+出發日期)/g, '$1\n$2');
+}
+
 function parseOrders(text) {
+  text = normalizeOrderText(text);
   // 先偵測特殊格式
   const transferOrder = parseTransferOrder(text);
   if (transferOrder) return [transferOrder];
@@ -923,6 +986,22 @@ function parseOrders(text) {
     results.push({ orderId, time, pax, price, loc, type, remarks, date, customerKey });
   });
   return results;
+}
+
+function parsePlaceholder(text) {
+  const normalized = String(text).normalize('NFKC').trim();
+  const m = normalized.match(/^(取消)?\s*(?:(\d{1,2}\/\d{1,2})\s+)?(?:補\s*(\d{1,4}(?::\d{2})?)|(\d{1,4}(?::\d{2})?)\s*補)\s*(?:的)?\s*(送|接)?(?:機)?$/);
+  if (!m) return null;
+  const raw = m[3] || m[4];
+  let hour, minute;
+  if (raw.includes(':')) [hour, minute] = raw.split(':').map(Number);
+  else if (raw.length > 2) { hour = Number(raw.slice(0,-2)); minute = Number(raw.slice(-2)); }
+  else { hour = Number(raw); minute = 0; }
+  if (hour > 23 || minute > 59 || (m[2] && !normalizeDate(m[2]))) return { error: '補單日期或時間無效' };
+  const type = m[5] || '送';
+  const time = `${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`;
+  return { remove: Boolean(m[1]), date: m[2] ? normalizeDate(m[2]) : null, hour, type, time,
+    key: `placeholder|${time}|${type}`, display: `補${minute ? time : hour}${type}` };
 }
 
 function toMin(t) { const [h,m]=t.split(':').map(Number); return h*60+m; }
@@ -1031,12 +1110,12 @@ function toLineMessages(text) {
   ];
 }
 
-async function pushMessage(groupId, text) {
+async function pushMessage(groupId, text, retryKey = null) {
   await axios.post('https://api.line.me/v2/bot/message/push', {
     to: groupId,
     messages: toLineMessages(text)
   }, {
-    headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}` },
+    headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`, ...(retryKey ? { 'X-Line-Retry-Key': retryKey } : {}) },
     timeout: 8000,
   });
 }
@@ -1128,37 +1207,20 @@ async function sendOrScheduleSummary(replyToken, groupId, date) {
 function buildCommandHelp() {
   const currentYear = getBusinessDateParts().year;
   return [
-    `機場接送 Bot 指令（版本 ${BOT_VERSION}）`,
-    '',
-    '【查詢】',
-    '測試：確認 Bot 與版本',
-    '指令／說明：顯示本說明',
-    '簡表：最近服務日簡表',
-    '簡表 10/27：指定日期簡表',
+    `機場接送 Bot 指令（版本 ${BOT_VERSION}）`, '',
+    '【查詢】', '測試：確認 Bot 與版本', '指令／說明：顯示本說明',
+    '簡表：最近服務日簡表', '簡表 10/27：指定日期簡表',
     `簡表 ${currentYear}/10/27：指定年份與日期簡表`,
     '群組診斷 10/27：只讀診斷，不修改資料',
-    `群組診斷 ${currentYear}/10/27：指定年份診斷`,
-    '',
-    '【月結】',
-    '月結：當月報表',
-    '月結 10月：今年指定月份',
-    `月結 ${currentYear}/10：指定年份與月份`,
-    '月結 Excel：當月 Excel',
+    `群組診斷 ${currentYear}/10/27：指定年份診斷`, '',
+    '【月結】', '月結：當月報表', '月結 10月：今年指定月份',
+    `月結 ${currentYear}/10：指定年份與月份`, '月結 Excel：當月 Excel',
     '月結 10月 Excel：今年指定月份 Excel',
-    `月結 ${currentYear}/10 Excel：指定年份與月份 Excel`,
-    '',
+    `月結 ${currentYear}/10 Excel：指定年份與月份 Excel`, '',
     '【訂單異動；ABC12345 請換成實際編號】',
-    'ABC12345 取消',
-    'ABC12345 收回',
-    'ABC12345 拉回',
-    'ABC12345 改派',
-    'ABC12345 拉回改派',
-    '多筆編號可逐行輸入，最後一行輸入「以上取消」等動作',
-    '',
-    '【其他】',
-    '補12送／補09接：建立待補提示',
-    '0740 蘆竹交通車 3人：建立交通車紀錄',
-    '',
+    'ABC12345 取消', 'ABC12345 收回', 'ABC12345 拉回', 'ABC12345 改派', 'ABC12345 拉回改派',
+    '多筆編號可逐行輸入，最後一行輸入「以上取消」等動作', '',
+    '【補單】', '補12送／補0430送／0430補接', '11/7 22補：指定日期補單', '',
     '直接貼完整訂單不需要另外輸入指令。所有查詢與異動只作用於目前群組。',
   ].join('\n');
 }
@@ -1247,6 +1309,7 @@ app.post('/webhook', async (req, res) => {
       try {
         groupIds[sourceId] = true;
         await handleLineUnsend(sourceId, event.unsend?.messageId);
+        await notifyLineUnsend(sourceId, event.unsend?.messageId);
       } finally {
         releaseSourceQueue();
       }
@@ -1262,6 +1325,8 @@ app.post('/webhook', async (req, res) => {
       senderId: event.source.userId,
       conversationType: event.source.type || (event.source.groupId ? 'group' : event.source.roomId ? 'room' : 'user'),
       messageId: event.message.id,
+      isRedelivery: event.deliveryContext?.isRedelivery === true,
+      eventTimestamp: Number(event.timestamp) || null,
     };
     const releaseSourceQueue = await acquireSourceQueue(sourceId);
     try {
@@ -1357,6 +1422,28 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    const placeholder = parsePlaceholder(text);
+    if (placeholder) {
+      if (placeholder.error) { await replyMessage(event.replyToken, placeholder.error); continue; }
+      let date = placeholder.date || lastActiveDate[sourceId];
+      if (!date && ordersCollection) {
+        const latest = await ordersCollection.find({ groupId: sourceId, cancelled: false }).sort({ updatedAt: -1 }).limit(1).toArray();
+        date = latest[0]?.date;
+      }
+      date = normalizeDate(date) || getTodayStr();
+      const order = { isPlaceholder: true, persistedPlaceholder: true, date, hour: placeholder.hour,
+        type: placeholder.type, time: placeholder.time, display: placeholder.display, lineMessageId: String(event.message.id) };
+      const saved = placeholder.remove
+        ? await markOrderCancelledInMongo(sourceId, date, placeholder.key, '取消補單')
+        : await saveOrderToMongo(sourceId, date, placeholder.key, order, auditContext);
+      if (saved !== true) { await replyMessage(event.replyToken, '補單儲存失敗，請稍後重試。'); continue; }
+      getDateOrders(sourceId, date, true)[placeholder.key] = placeholder.remove ? null : order;
+      lastActiveDate[sourceId] = date;
+      setChanged(sourceId, date);
+      await sendOrScheduleSummary(event.replyToken, sourceId, date);
+      continue;
+    }
+
     const withdrawal = parseDispatchAction(text);
     if (withdrawal) {
       if (withdrawal.error) {
@@ -1381,7 +1468,7 @@ app.post('/webhook', async (req, res) => {
             }
           }
           const reason = `客服${action}`;
-          const cancelled = (!found && !dates.size) || await markOrderCancelledInMongo(sourceId, found?.date, found?.key || orderId, reason);
+          const cancelled = (!found && !dates.size) || await markOrderCancelledInMongo(sourceId, found?.date, found?.key || orderId, reason, auditContext.eventTimestamp);
           const blocked = cancelled && await blockOrderReactivation(sourceId, orderId, reason, auditContext);
           if (!blocked) { failed.push(orderId); continue; }
           for (const [date, orders] of Object.entries(dailyOrders[sourceId] || {})) {
@@ -1403,7 +1490,7 @@ app.post('/webhook', async (req, res) => {
       const reports = [];
       if (orderIds.length > 1) reports.push(`批次${action}：完成 ${completed.length} 筆，失敗 ${failed.length} 筆。`);
       if (completed.length && (orderIds.length > 1 || !affectedDates.size)) {
-        reports.push(`${completed.join('、')} 已標記為${action}，重貼原單不會重新加入簡表或月結。`);
+        reports.push(`${completed.join('、')} 已標記為${action}，舊訊息重送不會恢復；需要重新派單時請重新傳送完整訂單。`);
       }
       if (failed.length) reports.push(`處理失敗／尚未確認完成：${failed.join('、')}。請查詢簡表確認後重試。`);
       for (const date of affectedDates) {
@@ -1473,25 +1560,6 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
-    // ── 5.5 補單提示：「補12送」「補09接」→ 先佔位，等實際訂單自動取代 ──
-    const placeholderM = text.match(/^補\s*(\d{1,2})\s*(送|接)$/);
-    if (placeholderM) {
-      const hour = parseInt(placeholderM[1]);
-      const type = placeholderM[2];
-      const date = lastActiveDate[sourceId] || getTodayStr();
-      const orders = getDateOrders(sourceId, date, true);
-      const key = `placeholder|${hour}|${type}`;
-      orders[key] = {
-        isPlaceholder: true,
-        hour, type,
-        time: `${String(hour).padStart(2,'0')}:00`,
-        display: `補${hour}${type}`,
-      };
-      setChanged(sourceId, date);
-      await sendOrScheduleSummary(event.replyToken, sourceId, date);
-      continue;
-    }
-
     // ── 5.6 交通車通知：「0740 蘆竹交通車」→ 顯示時間+地點，無金額無人數（除非有標註人數）──
     const shuttleM = text.match(/^(\d{3,4})\s*(.+?交通車)\s*(\d+人)?$/);
     if (shuttleM) {
@@ -1552,16 +1620,11 @@ app.post('/webhook', async (req, res) => {
       }
       if (!stagedOrders.length && suppressedOrders.length) {
         await replyMessage(event.replyToken,
-          `已忽略訂單 ${suppressedOrders.join('、')}：該訂單已標記為拉回、改派或收回，不會重新加入簡表或月結。`);
+          `已忽略訂單 ${suppressedOrders.join('、')}：此為已撤回或較舊訊息的重送，不會重新加入簡表或月結。需要恢復派單時請重新傳送完整訂單。`);
         continue;
       }
       for (const { o, date, key } of stagedOrders) {
         const orders = getDateOrders(sourceId, date, true);
-        // 檢查是否能取代某個補單佔位（同方向 + 同整點時段）
-        const oHour = parseInt(o.time.split(':')[0]);
-        const oType = o.type === '接' ? '接' : '送';
-        const placeholderKey = `placeholder|${oHour}|${oType}`;
-        if (orders[placeholderKey]?.isPlaceholder) delete orders[placeholderKey];
         orders[key] = o;
       }
       const date = normalizeDate(newOrders[0]?.date);
@@ -2504,6 +2567,7 @@ app.get('/health', (req, res) => {
     lineConfigured: Boolean(CHANNEL_SECRET && CHANNEL_ACCESS_TOKEN),
     databaseReady,
     testMode: TEST_MODE,
+    unsendAutoPush: UNSEND_AUTO_PUSH,
     timeZone: BUSINESS_TIME_ZONE,
   });
 });
@@ -2580,7 +2644,6 @@ if (!IS_TEST_RUNTIME) {
   }, 13 * 60 * 1000);
 }
 
-// 統一處理 JSON 過大、壓縮內容或格式錯誤，避免回傳框架堆疊資訊。
 app.use((err, req, res, next) => {
   if (!err) return next();
   if (err.type === 'entity.too.large') return res.status(413).type('text/plain').send('Request too large');
@@ -2605,6 +2668,7 @@ module.exports = {
   parseAddr,
   parseAddrNoDefault,
   parseOrders,
+  parsePlaceholder,
   parseTransferOrder,
   parseDriverReportOrder,
   parseTableOrder,
