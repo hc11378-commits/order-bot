@@ -1,4 +1,4 @@
-# 機場接送 LINE Bot 2.1.0 融合版
+# 機場接送 LINE Bot 2.2.0 融合版
 
 這是將現有程式、全台行政區、批次異動功能、維護修正與測試整合後的乾淨部署版本。
 
@@ -10,9 +10,11 @@
 - `test.js`：核心、行政區與批次異動測試
 - `unsend.test.js`：LINE 收回後自動更新簡表測試
 - `fixes.test.js`：重新派單、補單與地址修正測試
+- `placard.test.js`：舉牌扣款、客上自接與司機自接測試
+- `README.md`：完整使用說明與所有指令
 - `TESTING-GUIDE.md`：本說明
 
-請將以上八個檔案放在 GitHub 專案根目錄。不要上傳 `node_modules`，也不要把 Token、Secret、MongoDB 密碼寫進任何檔案。
+請將以上十個檔案放在 GitHub 專案根目錄。不要上傳 `node_modules`，也不要把 Token、Secret、MongoDB 密碼寫進任何檔案。
 
 ## Render 必要環境變數
 
@@ -35,7 +37,7 @@ Render 設定：
 ```json
 {
   "status": "ok",
-  "version": "2.1.0-fused",
+  "version": "2.2.0-fused",
   "lineConfigured": true,
   "databaseReady": true,
   "testMode": true,
@@ -104,7 +106,7 @@ npm test
 npm audit --omit=dev
 ```
 
-正確結果應為 211 項測試全部通過、0 項失敗，安全掃描為 0 個已知漏洞。
+正確結果應為 216 項測試全部通過、0 項失敗，安全掃描為 0 個已知漏洞。
 
 ## 重要行為
 
@@ -115,6 +117,8 @@ npm audit --omit=dev
 - LINE 收回事件成功取消後會自動推送最新簡表；最後一筆收回也會顯示零筆及零元。
 - 補單可使用 `22補`、`補0430送`、`0430補接`，也可指定日期，例如 `11/7 22補`。
 - 誤取消或誤拉回後，客服用新的 LINE 訊息重貼可恢復；LINE 舊事件重送不會覆蓋新版。
+- 一般舉牌訂單每筆扣100元；司機回覆原訂單輸入「客上自接」或「司機自接」後顯示為「舉牌*」且不扣款。
+- 簡表、群組診斷、月結及 Excel 均使用「業績＝結算價＋客收－舉牌服務扣款」。
 - 一次性歷史修復指令已退役，輸入後不會修改資料。
 - `TEST_MODE=true` 使用 Reply 回覆並停用排程 Push，適合訊息額度不足時測試。
 

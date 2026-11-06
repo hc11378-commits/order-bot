@@ -16,7 +16,8 @@ const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const UNSEND_AUTO_PUSH = process.env.UNSEND_AUTO_PUSH?.trim().toLowerCase() !== 'false';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '2.1.0-fused';
+const BOT_VERSION = '2.2.0-fused';
+const PLACARD_SERVICE_FEE = 100;
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -1014,6 +1015,18 @@ function getCustomerCollectionTotal(order) {
   }, 0);
 }
 
+function hasPlacardService(order) {
+  return (order?.remarks || []).some(remark => String(remark) === '舉牌');
+}
+
+function isPlacardSelfPickup(order) {
+  return hasPlacardService(order) && order?.placardSelfPickup === true;
+}
+
+function getPlacardDeduction(order) {
+  return hasPlacardService(order) && !isPlacardSelfPickup(order) ? PLACARD_SERVICE_FEE : 0;
+}
+
 // 簡表與會計報表只顯示會影響現場作業或金額的標準欄位。
 // 禁煙提醒、LINE ID、姓名、電話及其他自由文字不放進簡表，避免畫面雜亂與個資外露。
 function getOperationalRemarks(order) {
@@ -1023,7 +1036,9 @@ function getOperationalRemarks(order) {
 
 function getSummaryLineRemarks(order) {
   const customerRemarks = (order?.remarks || []).filter(remark => /^客收\s*[\d,]+(?:\.\d+)?$/.test(String(remark)));
-  return [...new Set([...getOperationalRemarks(order), ...customerRemarks])];
+  const operational = getOperationalRemarks(order).map(remark =>
+    remark === '舉牌' && isPlacardSelfPickup(order) ? '舉牌*' : remark);
+  return [...new Set([...operational, ...customerRemarks])];
 }
 
 function buildSummary(groupId, date, orders, options = {}) {
@@ -1032,6 +1047,9 @@ function buildSummary(groupId, date, orders, options = {}) {
   active.sort((a,b) => toMin(a.time) - toMin(b.time));
 
   let customerCollectionTotal = 0;
+  let placardDeductionTotal = 0;
+  let placardDeductionCount = 0;
+  let placardSelfPickupCount = 0;
   const otherCount = {};
   active.forEach(o => {
     if (o.isPlaceholder || o.isShuttle) return;
@@ -1039,6 +1057,10 @@ function buildSummary(groupId, date, orders, options = {}) {
       otherCount[r] = (otherCount[r]||0) + 1;
     });
     customerCollectionTotal += getCustomerCollectionTotal(o);
+    const deduction = getPlacardDeduction(o);
+    placardDeductionTotal += deduction;
+    if (deduction > 0) placardDeductionCount++;
+    if (isPlacardSelfPickup(o)) placardSelfPickupCount++;
   });
 
   let total = 0;
@@ -1071,11 +1093,15 @@ function buildSummary(groupId, date, orders, options = {}) {
 
     lines.push(`${i+1}。${o.time}，${locStr}，${rStr}${o.pax}${typeof o.pax === 'string' && o.pax.includes('人') ? '' : '人'}，${priceStr}`);
   });
-  const performanceTotal = total + customerCollectionTotal;
+  const performanceTotal = total + customerCollectionTotal - placardDeductionTotal;
   const pendingSuffix = hasUnconfirmed ? '+待確認' : '';
   lines.push(`結算價合計：${fmtP(total)}${pendingSuffix}`);
   lines.push(`客收合計：${fmtP(customerCollectionTotal)}`);
+  if (placardDeductionTotal > 0) {
+    lines.push(`舉牌服務扣款：${fmtP(placardDeductionTotal)}（${placardDeductionCount}筆）`);
+  }
   lines.push(`業績合計：${fmtP(performanceTotal)}${pendingSuffix}`);
+  if (placardSelfPickupCount > 0) lines.push('*：客上自接／司機自接，本筆不扣舉牌服務費');
   const otherParts = [];
   Object.entries(otherCount).forEach(([k,v]) => otherParts.push(k+'*'+v));
   if (otherParts.length) lines.push(`其他備註統計：${otherParts.join('、')}`);
@@ -1220,6 +1246,8 @@ function buildCommandHelp() {
     '【訂單異動；ABC12345 請換成實際編號】',
     'ABC12345 取消', 'ABC12345 收回', 'ABC12345 拉回', 'ABC12345 改派', 'ABC12345 拉回改派',
     '多筆編號可逐行輸入，最後一行輸入「以上取消」等動作', '',
+    '【舉牌自接】', '回覆原始舉牌訂單，輸入「客上自接」或「司機自接」',
+    '簡表會顯示舉牌*，本筆不扣100元', '',
     '【補單】', '補12送／補0430送／0430補接', '11/7 22補：指定日期補單', '',
     '直接貼完整訂單不需要另外輸入指令。所有查詢與異動只作用於目前群組。',
   ].join('\n');
@@ -1340,6 +1368,73 @@ app.post('/webhook', async (req, res) => {
 
     if (/^(?:指令|說明|help)$/i.test(text)) {
       await replyMessage(event.replyToken, buildCommandHelp());
+      continue;
+    }
+
+    // 司機必須「回覆原始訂單訊息」再輸入以下文字，quotedMessageId 才能精準對應訂單。
+    const placardSelfPickupMatch = text.match(/^(客上自接|司機自接)$/);
+    if (placardSelfPickupMatch) {
+      const quotedMessageId = event.message.quotedMessageId;
+      if (!quotedMessageId) {
+        await replyMessage(event.replyToken, '標記失敗：請使用 LINE「回覆」原始舉牌訂單，再輸入「客上自接」或「司機自接」。');
+        continue;
+      }
+      if (!ordersCollection) {
+        await replyMessage(event.replyToken, '標記失敗：資料庫目前未連線，沒有修改任何資料。');
+        continue;
+      }
+      const quotedRecords = dedupeOrderRecords(await ordersCollection.find({
+        groupId: sourceId,
+        lineMessageId: String(quotedMessageId),
+        cancelled: false,
+      }).toArray());
+      const placardRecords = quotedRecords.filter(hasPlacardService);
+      if (!placardRecords.length) {
+        await replyMessage(event.replyToken, '標記停止：找不到這則回覆所對應的有效舉牌訂單，沒有修改任何資料。請確認回覆的是原始訂單。');
+        continue;
+      }
+      const markedAt = new Date();
+      const result = await ordersCollection.updateMany({
+        groupId: sourceId,
+        lineMessageId: String(quotedMessageId),
+        remarks: '舉牌',
+        cancelled: false,
+      }, { $set: {
+        placardSelfPickup: true,
+        placardSelfPickupType: placardSelfPickupMatch[1],
+        placardSelfPickupBy: anonymizeId(event.source.userId),
+        placardSelfPickupMessageId: String(event.message.id),
+        placardSelfPickupAt: markedAt,
+        updatedAt: markedAt,
+      } });
+      if (result?.acknowledged === false) {
+        await replyMessage(event.replyToken, '標記失敗：資料庫未確認寫入，本次沒有回覆成功簡表。');
+        continue;
+      }
+      const affectedDates = new Set(placardRecords.map(record => normalizeDate(record.date)).filter(Boolean));
+      for (const [date, dateOrders] of Object.entries(dailyOrders[sourceId] || {})) {
+        let changed = false;
+        for (const order of Object.values(dateOrders)) {
+          if (order?.lineMessageId === String(quotedMessageId) && hasPlacardService(order)) {
+            order.placardSelfPickup = true;
+            order.placardSelfPickupType = placardSelfPickupMatch[1];
+            changed = true;
+          }
+        }
+        if (changed) affectedDates.add(date);
+      }
+      const reports = [`已標記「${placardSelfPickupMatch[1]}」：舉牌保留為「舉牌*」，本筆不扣100元。`];
+      for (const record of placardRecords) {
+        const date = normalizeDate(record.date);
+        if (date) setChanged(sourceId, date);
+      }
+      for (const date of affectedDates) {
+        const serviceYear = Number(placardRecords.find(record => normalizeDate(record.date) === date)?.serviceYear)
+          || getBusinessDateParts().year;
+        const orders = await refreshDateOrdersFromMongo(sourceId, date, serviceYear);
+        reports.push(buildSummary(sourceId, date, orders || {}, { forceUpdated: true }) || `${date}（更新）\n目前無有效訂單\n結算價合計：0\n客收合計：0\n業績合計：0`);
+      }
+      await replyMessage(event.replyToken, reports.join('\n\n'));
       continue;
     }
 
@@ -1835,15 +1930,16 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
     const customerCollectionTotal = activeOrders.reduce(
       (sum, record) => sum + getCustomerCollectionTotal(record), 0
     );
-    const performanceTotal = settlementTotal + customerCollectionTotal;
+    const placardDeductionTotal = activeOrders.reduce((sum, record) => sum + getPlacardDeduction(record), 0);
+    const performanceTotal = settlementTotal + customerCollectionTotal - placardDeductionTotal;
     const senderKeys = new Set(records.map(record => record.senderKey || '舊資料').filter(Boolean));
     const orderLines = activeOrders.slice(0, 25).map((record, index) => {
       const location = formatOrderLocation(record);
       const price = typeof record.price === 'number'
         ? fmtP(record.price)
         : (getCustomerCollectionTotal(record) > 0 ? '客收計價' : '待確認金額');
-      const remarks = Array.isArray(record.remarks) && record.remarks.length
-        ? `，${record.remarks.join('、')}` : '';
+      const visibleRemarks = getSummaryLineRemarks(record);
+      const remarks = visibleRemarks.length ? `，${visibleRemarks.join('、')}` : '';
       return `${index + 1}。${record.time || '時間待確認'}，${location}，${price}${remarks}`;
     });
     if (activeOrders.length > 25) orderLines.push(`其餘 ${activeOrders.length - 25} 筆省略`);
@@ -1860,6 +1956,7 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
       `MongoDB有效訂單：${activeOrders.length} 筆`,
       `結算價總額：${fmtP(settlementTotal)}`,
       `客收總額：${fmtP(customerCollectionTotal)}`,
+      `舉牌服務扣款：${fmtP(placardDeductionTotal)}`,
       `業績總額：${fmtP(performanceTotal)}${pendingPriceCount ? '+待確認' : ''}`,
       ...(pendingPriceCount ? [`待確認金額：${pendingPriceCount} 筆`] : []),
       `資料內發單者：${senderKeys.size} 種（舊資料可能沒有發送者代碼）`,
@@ -2322,6 +2419,9 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
 
   let settlementTotal = 0;
   let customerCollectionTotal = 0;
+  let placardDeductionTotal = 0;
+  let placardDeductionCount = 0;
+  let placardSelfPickupCount = 0;
   let pendingPriceCount = 0;
   const kesuCount = { count: 0 };
   const remarkCount = { 舉牌: 0, 安椅: 0, 增高墊: 0 };
@@ -2329,7 +2429,7 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
 
   activeOrders.forEach(o => {
     if (!dailyStats[o.date]) {
-      dailyStats[o.date] = { count: 0, settlement: 0, customerCollection: 0, pending: 0 };
+      dailyStats[o.date] = { count: 0, settlement: 0, customerCollection: 0, placardDeduction: 0, pending: 0 };
     }
     const stats = dailyStats[o.date];
     stats.count++;
@@ -2343,6 +2443,11 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
     const orderCustomerCollection = getCustomerCollectionTotal(o);
     customerCollectionTotal += orderCustomerCollection;
     stats.customerCollection += orderCustomerCollection;
+    const placardDeduction = getPlacardDeduction(o);
+    placardDeductionTotal += placardDeduction;
+    stats.placardDeduction += placardDeduction;
+    if (placardDeduction > 0) placardDeductionCount++;
+    if (isPlacardSelfPickup(o)) placardSelfPickupCount++;
     (o.remarks || []).forEach(r => {
       if (r.startsWith('客收')) {
         kesuCount.count++;
@@ -2353,7 +2458,7 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
   });
 
   const tripCount = activeOrders.length;
-  const performanceTotal = settlementTotal + customerCollectionTotal;
+  const performanceTotal = settlementTotal + customerCollectionTotal - placardDeductionTotal;
   const avgPerTrip = performanceTotal / tripCount;
   const pendingSuffix = pendingPriceCount ? '+待確認' : '';
   const sortedDates = Object.keys(dailyStats).sort((a, b) => {
@@ -2367,24 +2472,26 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
   const lines = [];
   lines.push(`${year}年${month}月結算報表`);
   lines.push(`資料涵蓋：${firstDate}${firstDate === lastDate ? '' : `～${lastDate}`}`);
-  lines.push('統計口徑：未取消；業績＝結算價＋客收');
+  lines.push('統計口徑：未取消；業績＝結算價＋客收－舉牌服務扣款');
   lines.push(`總趟數：${tripCount} 趟`);
   lines.push(`結算價總額：${fmtP(settlementTotal)}${pendingSuffix}`);
   lines.push(`客收總額：${fmtP(customerCollectionTotal)}（共${kesuCount.count}筆）`);
+  lines.push(`舉牌服務扣款：${fmtP(placardDeductionTotal)}（${placardDeductionCount}筆）`);
   lines.push(`業績總額：${fmtP(performanceTotal)}${pendingSuffix}`);
   if (pendingPriceCount) {
     lines.push(`待確認結算價：${pendingPriceCount} 筆（已知客收仍納入業績）`);
   }
   lines.push(`平均每趟業績：${fmtP(Math.round(avgPerTrip * 10) / 10)}${pendingSuffix}`);
   if (remarkCount.舉牌 > 0) lines.push(`舉牌次數：${remarkCount.舉牌}`);
+  if (placardSelfPickupCount > 0) lines.push(`舉牌自接：${placardSelfPickupCount}筆（以舉牌*表示，不扣款）`);
   if (remarkCount.安椅 > 0) lines.push(`安椅次數：${remarkCount.安椅}`);
   if (remarkCount.增高墊 > 0) lines.push(`增高墊次數：${remarkCount.增高墊}`);
   lines.push('每日明細：');
   sortedDates.forEach(date => {
     const stats = dailyStats[date];
-    const dailyPerformance = stats.settlement + stats.customerCollection;
+    const dailyPerformance = stats.settlement + stats.customerCollection - stats.placardDeduction;
     const dailyPendingSuffix = stats.pending ? '+待確認' : '';
-    lines.push(`${date}：${stats.count} 趟，結算價${fmtP(stats.settlement)}${dailyPendingSuffix}，客收${fmtP(stats.customerCollection)}，業績${fmtP(dailyPerformance)}${dailyPendingSuffix}`);
+    lines.push(`${date}：${stats.count} 趟，結算價${fmtP(stats.settlement)}${dailyPendingSuffix}，客收${fmtP(stats.customerCollection)}，舉牌扣款${fmtP(stats.placardDeduction)}，業績${fmtP(dailyPerformance)}${dailyPendingSuffix}`);
   });
 
   return lines.join('\n');
@@ -2494,24 +2601,28 @@ async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts(
 
   let settlementTotal = 0;
   let customerTotal = 0;
+  let placardDeductionTotal = 0;
   let pendingCount = 0;
   const daily = new Map();
   for (const order of orders) {
     const settlement = typeof order.price === 'number' ? order.price : 0;
     const customer = getCustomerCollectionTotal(order);
+    const placardDeduction = getPlacardDeduction(order);
     settlementTotal += settlement;
     customerTotal += customer;
+    placardDeductionTotal += placardDeduction;
     if (typeof order.price !== 'number' && customer <= 0) pendingCount++;
-    const stats = daily.get(order.date) || { trips: 0, settlement: 0, customer: 0, pending: 0 };
+    const stats = daily.get(order.date) || { trips: 0, settlement: 0, customer: 0, placardDeduction: 0, pending: 0 };
     stats.trips++;
     stats.settlement += settlement;
     stats.customer += customer;
+    stats.placardDeduction += placardDeduction;
     if (typeof order.price !== 'number' && customer <= 0) stats.pending++;
     daily.set(order.date, stats);
   }
 
   const dates = [...daily.keys()].sort((a, b) => compareServiceDate({ date: a }, { date: b }));
-  const performanceTotal = settlementTotal + customerTotal;
+  const performanceTotal = settlementTotal + customerTotal - placardDeductionTotal;
   const summaryRows = [
     styledRow([`${year}年${month}月結算報表`, ''], 2),
     ['群組代碼', anonymizeId(groupId)],
@@ -2519,25 +2630,28 @@ async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts(
     ['總趟數', orders.length],
     ['結算價總額', settlementTotal],
     ['客收總額', customerTotal],
+    ['舉牌服務扣款', placardDeductionTotal],
     ['業績總額', performanceTotal],
     ['平均每趟業績', Math.round((performanceTotal / orders.length) * 10) / 10],
     ['待確認金額筆數', pendingCount],
     [],
-    styledRow(['日期', '趟數', '結算價', '客收', '業績', '待確認筆數'], 1),
+    styledRow(['日期', '趟數', '結算價', '客收', '舉牌扣款', '業績', '待確認筆數'], 1),
     ...dates.map(date => {
       const stats = daily.get(date);
-      return [date, stats.trips, stats.settlement, stats.customer, stats.settlement + stats.customer, stats.pending];
+      return [date, stats.trips, stats.settlement, stats.customer, stats.placardDeduction,
+        stats.settlement + stats.customer - stats.placardDeduction, stats.pending];
     }),
   ];
   const detailRows = [
-    styledRow(['日期', '時間', '接送', '縣市區域', '人數', '訂單編號', '結算價', '客收', '業績', '必要備註'], 1),
+    styledRow(['日期', '時間', '接送', '縣市區域', '人數', '訂單編號', '結算價', '客收', '舉牌扣款', '業績', '必要備註'], 1),
     ...orders.map(order => {
       const settlement = typeof order.price === 'number' ? order.price : 0;
       const customer = getCustomerCollectionTotal(order);
+      const placardDeduction = getPlacardDeduction(order);
       return [
         order.date || '', order.time || '', order.type || '', order.loc || '', order.pax ?? '',
         order.orderId || '', typeof order.price === 'number' ? order.price : '', customer,
-        settlement + customer, getOperationalRemarks(order).join('、'),
+        placardDeduction, settlement + customer - placardDeduction, getSummaryLineRemarks(order).join('、'),
       ];
     }),
   ];
@@ -2549,8 +2663,8 @@ async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts(
     'xl/workbook.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="月結總表" sheetId="1" r:id="rId1"/><sheet name="訂單明細" sheetId="2" r:id="rId2"/></sheets></workbook>'),
     'xl/_rels/workbook.xml.rels': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'),
     'xl/styles.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="3"><font><sz val="11"/><name val="Arial"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Arial"/></font><font><b/><sz val="14"/><name val="Arial"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"/><right style="thin"/><top style="thin"/><bottom style="thin"/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>'),
-    'xl/worksheets/sheet1.xml': strToU8(worksheetXml(summaryRows, [22, 22, 16, 16, 16, 16], `A11:F${summaryRows.length}`)),
-    'xl/worksheets/sheet2.xml': strToU8(worksheetXml(detailRows, [12, 10, 10, 24, 10, 18, 14, 14, 14, 18], `A1:J${detailRows.length}`)),
+    'xl/worksheets/sheet1.xml': strToU8(worksheetXml(summaryRows, [22, 22, 16, 16, 16, 16, 16], `A12:G${summaryRows.length}`)),
+    'xl/worksheets/sheet2.xml': strToU8(worksheetXml(detailRows, [12, 10, 10, 24, 10, 18, 14, 14, 14, 14, 18], `A1:K${detailRows.length}`)),
     'docProps/core.xml': strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${year}年${month}月機場接送月結</dc:title><dc:creator>Airport Transfer Bot</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">${created}</dcterms:created></cp:coreProperties>`),
     'docProps/app.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Airport Transfer Bot</Application></Properties>'),
   };
@@ -2678,6 +2792,9 @@ module.exports = {
   buildCommandHelp,
   getOperationalRemarks,
   getSummaryLineRemarks,
+  hasPlacardService,
+  isPlacardSelfPickup,
+  getPlacardDeduction,
   normalizeDate,
   extractServiceYear,
   getBusinessDateParts,

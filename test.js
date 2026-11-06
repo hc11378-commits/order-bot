@@ -288,7 +288,7 @@ test('跨年度月結指令可指定年份、月份與 Excel', () => {
 
 test('內建指令說明涵蓋簡表、診斷、月結 Excel 與訂單異動', () => {
   const help = bot.buildCommandHelp();
-  assert.match(help, /版本 2\.1\.0-fused/);
+  assert.match(help, /版本 2\.2\.0-fused/);
   assert.match(help, /簡表 10\/27/);
   assert.match(help, /群組診斷/);
   assert.match(help, /月結 Excel/);
@@ -913,7 +913,8 @@ test('9/11 舊資料修復精準交換收回單與自客單，重跑不重複且
     assert.match(first, /MongoDB有效訂單：7 筆/);
     assert.match(first, /結算價總額：4473/);
     assert.match(first, /客收總額：900/);
-    assert.match(first, /業績總額：5373/);
+    assert.match(first, /舉牌服務扣款：100/);
+    assert.match(first, /業績總額：5273/);
     assert.match(first, /04:20，送新北中和，客收計價，客收900/);
     assert.doesNotMatch(first, /\d+。04:50，送新北中和，978/);
 
@@ -925,7 +926,8 @@ test('9/11 舊資料修復精準交換收回單與自客單，重跑不重複且
     assert.match(monthly, /總趟數：7 趟/);
     assert.match(monthly, /結算價總額：4473/);
     assert.match(monthly, /客收總額：900（共1筆）/);
-    assert.match(monthly, /業績總額：5373/);
+    assert.match(monthly, /舉牌服務扣款：100（1筆）/);
+    assert.match(monthly, /業績總額：5273/);
 
     const originalPost = axios.post;
     let replyText = '';
@@ -1857,7 +1859,8 @@ test('簡表只顯示必要備註並保留客收金額，隱藏禁煙與 LINE ID
   assert.match(summary, /其他備註統計：舉牌\*1、安椅\*1、增高墊\*1/);
   assert.match(summary, /結算價合計：763/);
   assert.match(summary, /客收合計：200/);
-  assert.match(summary, /業績合計：963/);
+  assert.match(summary, /舉牌服務扣款：100（1筆）/);
+  assert.match(summary, /業績合計：863/);
 });
 
 test('月結 Excel 指令支援當月與指定月份並拒絕無效月份', () => {
