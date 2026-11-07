@@ -288,7 +288,7 @@ test('跨年度月結指令可指定年份、月份與 Excel', () => {
 
 test('內建指令說明涵蓋簡表、診斷、月結 Excel 與訂單異動', () => {
   const help = bot.buildCommandHelp();
-  assert.match(help, /版本 2\.2\.0-fused/);
+  assert.match(help, /版本 2\.3\.0-fused/);
   assert.match(help, /簡表 10\/27/);
   assert.match(help, /群組診斷/);
   assert.match(help, /月結 Excel/);

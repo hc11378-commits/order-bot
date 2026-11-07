@@ -42,10 +42,10 @@ test('LINE收回後重貼可恢復；重啟後也不接受原舊訊息',()=>harn
  await post(send,'original');await bot.handleLineUnsend(groupId,'original');await post(send,'restored');restart();await post(send.replace('1000.0','2.0'),'original',true);
  assert.equal(records.filter(r=>!r.cancelled).length,1);assert.equal(records.find(r=>!r.cancelled).price,1000);
 }));
-test('補單持久化，重啟與同時段正式單不會自動刪除',()=>harness(async({post,records,restart})=>{
+test('補單持久化，重啟後同時段正式單會自動取代補單',()=>harness(async({post,records,restart})=>{
  await post(send);assert.match(await post('22補'),/補22送/);assert.match(await post('補0430的送'),/補04:30送/);restart();
  const summary=await post(pickup);assert.match(summary,/補22送/);assert.match(summary,/補04:30送/);assert.match(summary,/結算價合計：2035/);
- const next=await post(send.replace('WJP796330','NEW123456').replace('09:00','04:30'));assert.match(next,/補04:30送/);assert.match(next,/補22送/);
+ const next=await post(send.replace('WJP796330','NEW123456').replace('09:00','04:30'));assert.doesNotMatch(next,/補04:30送/);assert.match(next,/04:30/);assert.match(next,/補22送/);
  const cleared=await post('取消補0430送');assert.doesNotMatch(cleared,/補04:30送/);assert.match(cleared,/補22送/);restart();assert.doesNotMatch(await post(pickup),/補04:30送/);
  assert.equal(records.filter(r=>r.isPlaceholder&&!r.cancelled).length,1);
 }));

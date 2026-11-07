@@ -1,11 +1,11 @@
 {
   "name": "order-summary-bot",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test.js unsend.test.js fixes.test.js placard.test.js",
-    "check": "node --check index.js && node --check test.js && node --check unsend.test.js && node --check fixes.test.js && node --check placard.test.js"
+    "test": "node --test test.js unsend.test.js fixes.test.js placard.test.js operations.test.js",
+    "check": "node --check index.js && node --check test.js && node --check unsend.test.js && node --check fixes.test.js && node --check placard.test.js && node --check operations.test.js"
   },
   "engines": {
     "node": ">=20 <23"

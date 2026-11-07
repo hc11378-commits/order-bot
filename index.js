@@ -16,8 +16,10 @@ const TEST_MODE = process.env.TEST_MODE?.trim().toLowerCase() === 'true';
 const UNSEND_AUTO_PUSH = process.env.UNSEND_AUTO_PUSH?.trim().toLowerCase() !== 'false';
 const IS_TEST_RUNTIME = process.env.NODE_ENV === 'test';
 const BUSINESS_TIME_ZONE = 'Asia/Taipei';
-const BOT_VERSION = '2.2.0-fused';
+const BOT_VERSION = '2.3.0-fused';
 const PLACARD_SERVICE_FEE = 100;
+const MINIBUS_PER_THREE_HOURS = 2000;
+const MINIBUS_PER_MINUTE = MINIBUS_PER_THREE_HOURS / (3 * 60);
 
 if (!CHANNEL_SECRET || !CHANNEL_ACCESS_TOKEN) {
   throw new Error('缺少 LINE_CHANNEL_SECRET 或 LINE_CHANNEL_ACCESS_TOKEN 環境變數，請在 Render 後台設定');
@@ -179,6 +181,55 @@ async function saveOrderToMongo(groupId, date, key, order, audit = {}) {
     console.error('MongoDB 寫入失敗:', err.message);
     return false;
   }
+}
+
+// 正式訂單補進來後，移除同日、同時間、同接送方向的補單占位，避免簡表重複。
+async function clearMatchingPlaceholder(groupId, date, order) {
+  if (!ordersCollection || !groupId || !date || !order?.time || !order?.type) return true;
+  const canonicalDate = normalizeDate(date);
+  const memoryOrders = getDateOrders(groupId, canonicalDate) || {};
+  try {
+    const matchingKeys = new Set(Object.entries(memoryOrders)
+      .filter(([, candidate]) => placeholderMatchesOrder(candidate, order))
+      .map(([key]) => key));
+    if (typeof ordersCollection.find === 'function') {
+      const candidates = await ordersCollection.find({
+        groupId,
+        date: canonicalDate,
+        cancelled: false,
+      }).toArray();
+      candidates.filter(candidate => placeholderMatchesOrder(candidate, order) && candidate.key)
+        .forEach(candidate => matchingKeys.add(candidate.key));
+    }
+    for (const key of matchingKeys) {
+      const result = await ordersCollection.updateMany({
+        groupId,
+        date: canonicalDate,
+        key,
+        cancelled: false,
+      }, { $set: {
+        cancelled: true,
+        cancellationReason: '正式訂單已補入',
+        preventReactivation: false,
+        updatedAt: new Date(),
+      } });
+      if (result?.acknowledged === false) return false;
+      if (memoryOrders[key]) memoryOrders[key] = null;
+    }
+    return true;
+  } catch (err) {
+    console.error('正式訂單取代補單失敗:', err.message);
+    return false;
+  }
+}
+
+function placeholderMatchesOrder(placeholder, order) {
+  if (!placeholder?.isPlaceholder || !order || placeholder.type !== order.type) return false;
+  const legacyHourOnly = placeholder.hourOnly == null && /^補\d{1,2}(?:接|送)$/.test(String(placeholder.display || ''));
+  if (placeholder.hourOnly || legacyHourOnly) {
+    return Number(placeholder.hour) === Number(String(order.time || '').split(':')[0]);
+  }
+  return placeholder.time === order.time;
 }
 
 // 標記一筆訂單為已取消（月結統計時會排除）
@@ -956,13 +1007,13 @@ function parseOrders(text) {
   text = normalizeOrderText(text);
   // 先偵測特殊格式
   const transferOrder = parseTransferOrder(text);
-  if (transferOrder) return [transferOrder];
+  if (transferOrder) return [applyDerivedOrderFlags(transferOrder, text)];
 
   const driverReportOrder = parseDriverReportOrder(text);
-  if (driverReportOrder) return [driverReportOrder];
+  if (driverReportOrder) return [applyDerivedOrderFlags(driverReportOrder, text)];
 
   const tableOrder = parseTableOrder(text);
-  if (tableOrder) return [tableOrder];
+  if (tableOrder) return [applyDerivedOrderFlags(tableOrder, text)];
 
   // 一般訂單 / 外車格式一（共用邏輯）
   const blocks = splitBlocks(text);
@@ -986,7 +1037,52 @@ function parseOrders(text) {
     const customerKey = extractCustomerKey(b, date, type);
     results.push({ orderId, time, pax, price, loc, type, remarks, date, customerKey });
   });
-  return results;
+  return results.map(order => applyDerivedOrderFlags(order, text));
+}
+
+// 訂單文字同時包含「舉牌」與「自接」時，直接視為司機自接。
+// 這項旗標會跟著訂單保存，簡表、月結、診斷與 Excel 都使用同一結果。
+function applyDerivedOrderFlags(order, sourceText) {
+  if (hasPlacardService(order) && /自\s*接/.test(String(sourceText).normalize('NFKC'))) {
+    order.placardSelfPickup = true;
+    order.placardSelfPickupType = '司機自接';
+  }
+  return order;
+}
+
+function parseClockValue(raw) {
+  const value = String(raw || '').replace(':', '').padStart(4, '0');
+  if (!/^\d{4}$/.test(value)) return null;
+  const hour = Number(value.slice(0, 2));
+  const minute = Number(value.slice(2));
+  if (hour > 23 || minute > 59) return null;
+  return { hour, minute, time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}` };
+}
+
+function parseMinibusShift(text) {
+  const normalized = String(text).normalize('NFKC').trim().replace(/[ \t]+/g, ' ');
+  if (!normalized.includes('桃小巴')) return null;
+  const match = normalized.match(/^(?:(\d{1,2}\/\d{1,2})\s*)?(\d{1,2}:?\d{2})\s*[-~～—–至]\s*(\d{1,2}:?\d{2})\s*(桃小巴.*)$/);
+  if (!match) return { error: '桃小巴格式無法辨識，請使用例如「1320-1520 桃小巴」或「11/8 0610-1410 桃小巴桃園區 一車」。' };
+  const date = match[1] ? normalizeDate(match[1]) : null;
+  const start = parseClockValue(match[2]);
+  const end = parseClockValue(match[3]);
+  if ((match[1] && !date) || !start || !end) return { error: '桃小巴日期或時間無效，沒有儲存任何資料。' };
+  let durationMinutes = end.hour * 60 + end.minute - (start.hour * 60 + start.minute);
+  if (durationMinutes <= 0) durationMinutes += 24 * 60;
+  if (durationMinutes <= 0 || durationMinutes > 24 * 60) return { error: '桃小巴工時必須大於0且不可超過24小時。' };
+  const performance = Math.round(durationMinutes * MINIBUS_PER_MINUTE * 100) / 100;
+  return {
+    isMinibus: true,
+    date,
+    time: start.time,
+    endTime: end.time,
+    durationMinutes,
+    minibusHours: durationMinutes / 60,
+    minibusPerformance: performance,
+    minibusLabel: match[4].trim(),
+    key: `minibus|${start.time}`,
+  };
 }
 
 function parsePlaceholder(text) {
@@ -1001,8 +1097,9 @@ function parsePlaceholder(text) {
   if (hour > 23 || minute > 59 || (m[2] && !normalizeDate(m[2]))) return { error: '補單日期或時間無效' };
   const type = m[5] || '送';
   const time = `${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`;
-  return { remove: Boolean(m[1]), date: m[2] ? normalizeDate(m[2]) : null, hour, type, time,
-    key: `placeholder|${time}|${type}`, display: `補${minute ? time : hour}${type}` };
+  const hourOnly = !raw.includes(':') && raw.length <= 2;
+  return { remove: Boolean(m[1]), date: m[2] ? normalizeDate(m[2]) : null, hour, hourOnly, type, time,
+    key: `placeholder|${time}|${type}`, display: `補${minute ? time : String(hour).padStart(2, '0')}${type}` };
 }
 
 function toMin(t) { const [h,m]=t.split(':').map(Number); return h*60+m; }
@@ -1027,6 +1124,17 @@ function getPlacardDeduction(order) {
   return hasPlacardService(order) && !isPlacardSelfPickup(order) ? PLACARD_SERVICE_FEE : 0;
 }
 
+function getMinibusPerformance(order) {
+  if (!order?.isMinibus) return 0;
+  if (typeof order.minibusPerformance === 'number') return order.minibusPerformance;
+  return Math.round((Number(order.durationMinutes) || 0) * MINIBUS_PER_MINUTE * 100) / 100;
+}
+
+function formatHoursFromMinutes(minutes) {
+  const hours = Number(minutes || 0) / 60;
+  return `${fmtP(Math.round(hours * 100) / 100)}小時`;
+}
+
 // 簡表與會計報表只顯示會影響現場作業或金額的標準欄位。
 // 禁煙提醒、LINE ID、姓名、電話及其他自由文字不放進簡表，避免畫面雜亂與個資外露。
 function getOperationalRemarks(order) {
@@ -1042,7 +1150,11 @@ function getSummaryLineRemarks(order) {
 }
 
 function buildSummary(groupId, date, orders, options = {}) {
-  const active = Object.values(orders).filter(o => o !== null);
+  const stored = Object.values(orders).filter(o => o !== null);
+  const formalOrders = stored.filter(order => !order.isPlaceholder && !order.isShuttle && !order.isMinibus);
+  // 舊版若已同時留下補單與正式單，查詢簡表時也立即隱藏已被正式單取代的補單。
+  const active = stored.filter(order => !order.isPlaceholder ||
+    !formalOrders.some(formalOrder => placeholderMatchesOrder(order, formalOrder)));
   if (!active.length) return null;
   active.sort((a,b) => toMin(a.time) - toMin(b.time));
 
@@ -1050,8 +1162,15 @@ function buildSummary(groupId, date, orders, options = {}) {
   let placardDeductionTotal = 0;
   let placardDeductionCount = 0;
   let placardSelfPickupCount = 0;
+  let minibusMinutesTotal = 0;
+  let minibusPerformanceTotal = 0;
   const otherCount = {};
   active.forEach(o => {
+    if (o.isMinibus) {
+      minibusMinutesTotal += Number(o.durationMinutes) || 0;
+      minibusPerformanceTotal += getMinibusPerformance(o);
+      return;
+    }
     if (o.isPlaceholder || o.isShuttle) return;
     getOperationalRemarks(o).forEach(r => {
       otherCount[r] = (otherCount[r]||0) + 1;
@@ -1077,6 +1196,10 @@ function buildSummary(groupId, date, orders, options = {}) {
       lines.push(`${i+1}。${o.time}，${o.display}`);
       return;
     }
+    if (o.isMinibus) {
+      lines.push(`${i+1}。${o.time}–${o.endTime}，${o.minibusLabel || '桃小巴'}，${formatHoursFromMinutes(o.durationMinutes)}，業績${fmtP(getMinibusPerformance(o))}`);
+      return;
+    }
 
     const orderCustomerCollection = getCustomerCollectionTotal(o);
     const hasSettlementPrice = typeof o.price === 'number';
@@ -1093,12 +1216,18 @@ function buildSummary(groupId, date, orders, options = {}) {
 
     lines.push(`${i+1}。${o.time}，${locStr}，${rStr}${o.pax}${typeof o.pax === 'string' && o.pax.includes('人') ? '' : '人'}，${priceStr}`);
   });
-  const performanceTotal = total + customerCollectionTotal - placardDeductionTotal;
+  const airportPerformanceTotal = total + customerCollectionTotal - placardDeductionTotal;
+  const performanceTotal = airportPerformanceTotal + minibusPerformanceTotal;
   const pendingSuffix = hasUnconfirmed ? '+待確認' : '';
   lines.push(`結算價合計：${fmtP(total)}${pendingSuffix}`);
   lines.push(`客收合計：${fmtP(customerCollectionTotal)}`);
   if (placardDeductionTotal > 0) {
     lines.push(`舉牌服務扣款：${fmtP(placardDeductionTotal)}（${placardDeductionCount}筆）`);
+  }
+  if (minibusMinutesTotal > 0) {
+    lines.push(`機場接送業績合計：${fmtP(airportPerformanceTotal)}${pendingSuffix}`);
+    lines.push(`桃小巴時數合計：${formatHoursFromMinutes(minibusMinutesTotal)}`);
+    lines.push(`桃小巴業績合計：${fmtP(minibusPerformanceTotal)}`);
   }
   lines.push(`業績合計：${fmtP(performanceTotal)}${pendingSuffix}`);
   if (placardSelfPickupCount > 0) lines.push('*：客上自接／司機自接，本筆不扣舉牌服務費');
@@ -1246,9 +1375,12 @@ function buildCommandHelp() {
     '【訂單異動；ABC12345 請換成實際編號】',
     'ABC12345 取消', 'ABC12345 收回', 'ABC12345 拉回', 'ABC12345 改派', 'ABC12345 拉回改派',
     '多筆編號可逐行輸入，最後一行輸入「以上取消」等動作', '',
-    '【舉牌自接】', '回覆原始舉牌訂單，輸入「客上自接」或「司機自接」',
+    '【舉牌自接】', '舉牌訂單文字含「自接」，或回覆原始舉牌訂單輸入含「自接」的文字',
     '簡表會顯示舉牌*，本筆不扣100元', '',
-    '【補單】', '補12送／補0430送／0430補接', '11/7 22補：指定日期補單', '',
+    '【補單】', '補04接／補12送／補0430送／0430補接', '11/7 22補：指定日期補單',
+    '正式訂單補入同一時間與方向後，補單會自動被取代', '',
+    '【桃小巴】', '1320-1520桃小巴', '11/8 0610-1410 桃小巴桃園區 一車',
+    '每3小時業績2000元；只在收到桃小巴班次的群組顯示', '',
     '直接貼完整訂單不需要另外輸入指令。所有查詢與異動只作用於目前群組。',
   ].join('\n');
 }
@@ -1372,8 +1504,11 @@ app.post('/webhook', async (req, res) => {
     }
 
     // 司機必須「回覆原始訂單訊息」再輸入以下文字，quotedMessageId 才能精準對應訂單。
-    const placardSelfPickupMatch = text.match(/^(客上自接|司機自接)$/);
-    if (placardSelfPickupMatch) {
+    const containsSelfPickup = /自\s*接/.test(text.normalize('NFKC'));
+    const selfPickupCommandOnly = /^(?:(?:客上|司機)\s*)?自\s*接(?:\s*(?:這筆|此單|此筆))?$/.test(text.normalize('NFKC'));
+    const containsOrderFields = /出發日期|上車地點|下車地點|結(?:算|單)價|客收/.test(text);
+    if ((event.message.quotedMessageId && containsSelfPickup && !containsOrderFields) || selfPickupCommandOnly) {
+      const selfPickupType = /客上\s*自\s*接/.test(text.normalize('NFKC')) ? '客上自接' : '司機自接';
       const quotedMessageId = event.message.quotedMessageId;
       if (!quotedMessageId) {
         await replyMessage(event.replyToken, '標記失敗：請使用 LINE「回覆」原始舉牌訂單，再輸入「客上自接」或「司機自接」。');
@@ -1401,7 +1536,7 @@ app.post('/webhook', async (req, res) => {
         cancelled: false,
       }, { $set: {
         placardSelfPickup: true,
-        placardSelfPickupType: placardSelfPickupMatch[1],
+        placardSelfPickupType: selfPickupType,
         placardSelfPickupBy: anonymizeId(event.source.userId),
         placardSelfPickupMessageId: String(event.message.id),
         placardSelfPickupAt: markedAt,
@@ -1417,13 +1552,13 @@ app.post('/webhook', async (req, res) => {
         for (const order of Object.values(dateOrders)) {
           if (order?.lineMessageId === String(quotedMessageId) && hasPlacardService(order)) {
             order.placardSelfPickup = true;
-            order.placardSelfPickupType = placardSelfPickupMatch[1];
+            order.placardSelfPickupType = selfPickupType;
             changed = true;
           }
         }
         if (changed) affectedDates.add(date);
       }
-      const reports = [`已標記「${placardSelfPickupMatch[1]}」：舉牌保留為「舉牌*」，本筆不扣100元。`];
+      const reports = [`已標記「${selfPickupType}」：舉牌保留為「舉牌*」，本筆不扣100元。`];
       for (const record of placardRecords) {
         const date = normalizeDate(record.date);
         if (date) setChanged(sourceId, date);
@@ -1517,6 +1652,33 @@ app.post('/webhook', async (req, res) => {
       continue;
     }
 
+    // 桃小巴班次：支援「1320-1520桃小巴」及「11/8 0610-1410 桃小巴桃園區 一車」。
+    const minibus = parseMinibusShift(text);
+    if (minibus) {
+      if (minibus.error) { await replyMessage(event.replyToken, minibus.error); continue; }
+      let date = minibus.date || lastActiveDate[sourceId];
+      if (!date && ordersCollection) {
+        const latest = await ordersCollection.find({ groupId: sourceId, cancelled: false }).sort({ updatedAt: -1 }).limit(1).toArray();
+        date = latest[0]?.date;
+      }
+      date = normalizeDate(date) || getTodayStr();
+      const order = {
+        ...minibus,
+        date,
+        lineMessageId: String(event.message.id),
+      };
+      const saved = await saveOrderToMongo(sourceId, date, minibus.key, order, auditContext);
+      if (saved !== true) {
+        await replyMessage(event.replyToken, '桃小巴班次儲存失敗，沒有回覆成功簡表；請稍後安全重貼。');
+        continue;
+      }
+      getDateOrders(sourceId, date, true)[minibus.key] = order;
+      lastActiveDate[sourceId] = date;
+      setChanged(sourceId, date);
+      await sendOrScheduleSummary(event.replyToken, sourceId, date);
+      continue;
+    }
+
     const placeholder = parsePlaceholder(text);
     if (placeholder) {
       if (placeholder.error) { await replyMessage(event.replyToken, placeholder.error); continue; }
@@ -1526,8 +1688,20 @@ app.post('/webhook', async (req, res) => {
         date = latest[0]?.date;
       }
       date = normalizeDate(date) || getTodayStr();
+      if (!placeholder.remove) {
+        const currentOrders = await refreshDateOrdersFromMongo(sourceId, date);
+        const placeholderCandidate = { isPlaceholder: true, ...placeholder };
+        const alreadyFilled = Object.values(currentOrders || {}).some(order => order && !order.isPlaceholder &&
+          !order.isShuttle && !order.isMinibus && placeholderMatchesOrder(placeholderCandidate, order));
+        if (alreadyFilled) {
+          const summary = buildSummary(sourceId, date, currentOrders || {}, { forceUpdated: true });
+          await replyMessage(event.replyToken, `該時段已有正式訂單，未新增重複補單。\n\n${summary}`);
+          continue;
+        }
+      }
       const order = { isPlaceholder: true, persistedPlaceholder: true, date, hour: placeholder.hour,
-        type: placeholder.type, time: placeholder.time, display: placeholder.display, lineMessageId: String(event.message.id) };
+        hourOnly: placeholder.hourOnly, type: placeholder.type, time: placeholder.time,
+        display: placeholder.display, lineMessageId: String(event.message.id) };
       const saved = placeholder.remove
         ? await markOrderCancelledInMongo(sourceId, date, placeholder.key, '取消補單')
         : await saveOrderToMongo(sourceId, date, placeholder.key, order, auditContext);
@@ -1636,6 +1810,7 @@ app.post('/webhook', async (req, res) => {
       }
       for (const { o, date, key } of stagedOrders) {
         getDateOrders(sourceId, date, true)[key] = o;
+        await clearMatchingPlaceholder(sourceId, date, o);
         setChanged(sourceId, date);
       }
       const replacementKeys = new Set(stagedOrders.map(item => `${item.date}|${item.key}`));
@@ -1721,6 +1896,7 @@ app.post('/webhook', async (req, res) => {
       for (const { o, date, key } of stagedOrders) {
         const orders = getDateOrders(sourceId, date, true);
         orders[key] = o;
+        await clearMatchingPlaceholder(sourceId, date, o);
       }
       const date = normalizeDate(newOrders[0]?.date);
       if (newOrders.length) await sendOrScheduleSummary(event.replyToken, sourceId, date);
@@ -1921,7 +2097,9 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
       date,
       cancelled: false,
     }).sort({ time: 1, updatedAt: 1 }).toArray());
-    const activeOrders = records.filter(record => !record.isPlaceholder && !record.isShuttle);
+    const reportableOrders = records.filter(record => !record.isPlaceholder && !record.isShuttle);
+    const minibusOrders = reportableOrders.filter(record => record.isMinibus);
+    const activeOrders = reportableOrders.filter(record => !record.isMinibus);
     const validOrders = activeOrders.filter(record => typeof record.price === 'number');
     const pendingPriceCount = activeOrders.filter(record =>
       typeof record.price !== 'number' && getCustomerCollectionTotal(record) <= 0
@@ -1931,9 +2109,16 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
       (sum, record) => sum + getCustomerCollectionTotal(record), 0
     );
     const placardDeductionTotal = activeOrders.reduce((sum, record) => sum + getPlacardDeduction(record), 0);
-    const performanceTotal = settlementTotal + customerCollectionTotal - placardDeductionTotal;
+    const airportPerformanceTotal = settlementTotal + customerCollectionTotal - placardDeductionTotal;
+    const minibusMinutesTotal = minibusOrders.reduce((sum, record) => sum + (Number(record.durationMinutes) || 0), 0);
+    const minibusPerformanceTotal = minibusOrders.reduce((sum, record) => sum + getMinibusPerformance(record), 0);
+    const performanceTotal = airportPerformanceTotal + minibusPerformanceTotal;
     const senderKeys = new Set(records.map(record => record.senderKey || '舊資料').filter(Boolean));
-    const orderLines = activeOrders.slice(0, 25).map((record, index) => {
+    const displayOrders = [...reportableOrders].sort((a, b) => toMin(a.time || '00:00') - toMin(b.time || '00:00'));
+    const orderLines = displayOrders.slice(0, 25).map((record, index) => {
+      if (record.isMinibus) {
+        return `${index + 1}。${record.time}–${record.endTime}，${record.minibusLabel || '桃小巴'}，${formatHoursFromMinutes(record.durationMinutes)}，業績${fmtP(getMinibusPerformance(record))}`;
+      }
       const location = formatOrderLocation(record);
       const price = typeof record.price === 'number'
         ? fmtP(record.price)
@@ -1942,7 +2127,7 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
       const remarks = visibleRemarks.length ? `，${visibleRemarks.join('、')}` : '';
       return `${index + 1}。${record.time || '時間待確認'}，${location}，${price}${remarks}`;
     });
-    if (activeOrders.length > 25) orderLines.push(`其餘 ${activeOrders.length - 25} 筆省略`);
+    if (displayOrders.length > 25) orderLines.push(`其餘 ${displayOrders.length - 25} 筆省略`);
 
     return [
       '群組診斷（只讀，未修改資料）',
@@ -1954,9 +2139,15 @@ async function buildGroupDiagnostic(groupId, auditContext = {}, now = new Date()
       `群組類型：${auditContext.conversationType || 'unknown'}`,
       `記憶體有效訂單：${memoryOrders.length} 筆`,
       `MongoDB有效訂單：${activeOrders.length} 筆`,
+      ...(minibusOrders.length ? [`桃小巴班次：${minibusOrders.length} 筆`] : []),
       `結算價總額：${fmtP(settlementTotal)}`,
       `客收總額：${fmtP(customerCollectionTotal)}`,
       `舉牌服務扣款：${fmtP(placardDeductionTotal)}`,
+      ...(minibusOrders.length ? [
+        `機場接送業績：${fmtP(airportPerformanceTotal)}${pendingPriceCount ? '+待確認' : ''}`,
+        `桃小巴時數：${formatHoursFromMinutes(minibusMinutesTotal)}`,
+        `桃小巴業績：${fmtP(minibusPerformanceTotal)}`,
+      ] : []),
       `業績總額：${fmtP(performanceTotal)}${pendingPriceCount ? '+待確認' : ''}`,
       ...(pendingPriceCount ? [`待確認金額：${pendingPriceCount} 筆`] : []),
       `資料內發單者：${senderKeys.size} 種（舊資料可能沒有發送者代碼）`,
@@ -2412,8 +2603,10 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
     return '月結查詢時發生錯誤，請稍後再試。';
   }
 
-  const activeOrders = records.filter(r => !r.isPlaceholder && !r.isShuttle);
-  if (!activeOrders.length) {
+  const reportableOrders = records.filter(r => !r.isPlaceholder && !r.isShuttle);
+  const minibusOrders = reportableOrders.filter(r => r.isMinibus);
+  const activeOrders = reportableOrders.filter(r => !r.isMinibus);
+  if (!reportableOrders.length) {
     return `${year}年${month}月尚無有效訂單紀錄，無法產生月結報表。`;
   }
 
@@ -2422,6 +2615,8 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
   let placardDeductionTotal = 0;
   let placardDeductionCount = 0;
   let placardSelfPickupCount = 0;
+  let minibusMinutesTotal = 0;
+  let minibusPerformanceTotal = 0;
   let pendingPriceCount = 0;
   const kesuCount = { count: 0 };
   const remarkCount = { 舉牌: 0, 安椅: 0, 增高墊: 0 };
@@ -2429,7 +2624,7 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
 
   activeOrders.forEach(o => {
     if (!dailyStats[o.date]) {
-      dailyStats[o.date] = { count: 0, settlement: 0, customerCollection: 0, placardDeduction: 0, pending: 0 };
+      dailyStats[o.date] = { count: 0, settlement: 0, customerCollection: 0, placardDeduction: 0, minibusMinutes: 0, minibusPerformance: 0, pending: 0 };
     }
     const stats = dailyStats[o.date];
     stats.count++;
@@ -2457,9 +2652,22 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
     });
   });
 
+  minibusOrders.forEach(o => {
+    if (!dailyStats[o.date]) {
+      dailyStats[o.date] = { count: 0, settlement: 0, customerCollection: 0, placardDeduction: 0, minibusMinutes: 0, minibusPerformance: 0, pending: 0 };
+    }
+    const minutes = Number(o.durationMinutes) || 0;
+    const performance = getMinibusPerformance(o);
+    minibusMinutesTotal += minutes;
+    minibusPerformanceTotal += performance;
+    dailyStats[o.date].minibusMinutes += minutes;
+    dailyStats[o.date].minibusPerformance += performance;
+  });
+
   const tripCount = activeOrders.length;
-  const performanceTotal = settlementTotal + customerCollectionTotal - placardDeductionTotal;
-  const avgPerTrip = performanceTotal / tripCount;
+  const airportPerformanceTotal = settlementTotal + customerCollectionTotal - placardDeductionTotal;
+  const performanceTotal = airportPerformanceTotal + minibusPerformanceTotal;
+  const avgPerTrip = tripCount ? airportPerformanceTotal / tripCount : 0;
   const pendingSuffix = pendingPriceCount ? '+待確認' : '';
   const sortedDates = Object.keys(dailyStats).sort((a, b) => {
     const [aMonth, aDay] = a.split('/').map(Number);
@@ -2472,16 +2680,24 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
   const lines = [];
   lines.push(`${year}年${month}月結算報表`);
   lines.push(`資料涵蓋：${firstDate}${firstDate === lastDate ? '' : `～${lastDate}`}`);
-  lines.push('統計口徑：未取消；業績＝結算價＋客收－舉牌服務扣款');
+  lines.push(minibusOrders.length
+    ? '統計口徑：未取消；總業績＝機場接送業績＋桃小巴業績'
+    : '統計口徑：未取消；業績＝結算價＋客收－舉牌服務扣款');
   lines.push(`總趟數：${tripCount} 趟`);
   lines.push(`結算價總額：${fmtP(settlementTotal)}${pendingSuffix}`);
   lines.push(`客收總額：${fmtP(customerCollectionTotal)}（共${kesuCount.count}筆）`);
   lines.push(`舉牌服務扣款：${fmtP(placardDeductionTotal)}（${placardDeductionCount}筆）`);
+  if (minibusOrders.length) {
+    lines.push(`機場接送業績：${fmtP(airportPerformanceTotal)}${pendingSuffix}`);
+    lines.push(`桃小巴班次：${minibusOrders.length} 筆`);
+    lines.push(`桃小巴時數：${formatHoursFromMinutes(minibusMinutesTotal)}`);
+    lines.push(`桃小巴業績：${fmtP(minibusPerformanceTotal)}`);
+  }
   lines.push(`業績總額：${fmtP(performanceTotal)}${pendingSuffix}`);
   if (pendingPriceCount) {
     lines.push(`待確認結算價：${pendingPriceCount} 筆（已知客收仍納入業績）`);
   }
-  lines.push(`平均每趟業績：${fmtP(Math.round(avgPerTrip * 10) / 10)}${pendingSuffix}`);
+  if (tripCount) lines.push(`${minibusOrders.length ? '平均每趟機場接送業績' : '平均每趟業績'}：${fmtP(Math.round(avgPerTrip * 10) / 10)}${pendingSuffix}`);
   if (remarkCount.舉牌 > 0) lines.push(`舉牌次數：${remarkCount.舉牌}`);
   if (placardSelfPickupCount > 0) lines.push(`舉牌自接：${placardSelfPickupCount}筆（以舉牌*表示，不扣款）`);
   if (remarkCount.安椅 > 0) lines.push(`安椅次數：${remarkCount.安椅}`);
@@ -2489,9 +2705,12 @@ async function buildMonthlyReport(groupId, month, year = getBusinessDateParts().
   lines.push('每日明細：');
   sortedDates.forEach(date => {
     const stats = dailyStats[date];
-    const dailyPerformance = stats.settlement + stats.customerCollection - stats.placardDeduction;
+    const dailyAirportPerformance = stats.settlement + stats.customerCollection - stats.placardDeduction;
+    const dailyPerformance = dailyAirportPerformance + stats.minibusPerformance;
     const dailyPendingSuffix = stats.pending ? '+待確認' : '';
-    lines.push(`${date}：${stats.count} 趟，結算價${fmtP(stats.settlement)}${dailyPendingSuffix}，客收${fmtP(stats.customerCollection)}，舉牌扣款${fmtP(stats.placardDeduction)}，業績${fmtP(dailyPerformance)}${dailyPendingSuffix}`);
+    const minibusPart = stats.minibusMinutes > 0
+      ? `，桃小巴${formatHoursFromMinutes(stats.minibusMinutes)}／${fmtP(stats.minibusPerformance)}` : '';
+    lines.push(`${date}：${stats.count} 趟，結算價${fmtP(stats.settlement)}${dailyPendingSuffix}，客收${fmtP(stats.customerCollection)}，舉牌扣款${fmtP(stats.placardDeduction)}${minibusPart}，業績${fmtP(dailyPerformance)}${dailyPendingSuffix}`);
   });
 
   return lines.join('\n');
@@ -2599,12 +2818,30 @@ async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts(
   const orders = await loadMonthlyActiveOrders(groupId, month, year);
   if (!orders?.length) return null;
 
+  const airportOrders = orders.filter(order => !order.isMinibus);
+  const minibusOrders = orders.filter(order => order.isMinibus);
   let settlementTotal = 0;
   let customerTotal = 0;
   let placardDeductionTotal = 0;
+  let minibusMinutesTotal = 0;
+  let minibusPerformanceTotal = 0;
   let pendingCount = 0;
   const daily = new Map();
   for (const order of orders) {
+    const stats = daily.get(order.date) || {
+      trips: 0, settlement: 0, customer: 0, placardDeduction: 0,
+      minibusMinutes: 0, minibusPerformance: 0, pending: 0,
+    };
+    if (order.isMinibus) {
+      const minutes = Number(order.durationMinutes) || 0;
+      const minibusPerformance = getMinibusPerformance(order);
+      minibusMinutesTotal += minutes;
+      minibusPerformanceTotal += minibusPerformance;
+      stats.minibusMinutes += minutes;
+      stats.minibusPerformance += minibusPerformance;
+      daily.set(order.date, stats);
+      continue;
+    }
     const settlement = typeof order.price === 'number' ? order.price : 0;
     const customer = getCustomerCollectionTotal(order);
     const placardDeduction = getPlacardDeduction(order);
@@ -2612,7 +2849,6 @@ async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts(
     customerTotal += customer;
     placardDeductionTotal += placardDeduction;
     if (typeof order.price !== 'number' && customer <= 0) pendingCount++;
-    const stats = daily.get(order.date) || { trips: 0, settlement: 0, customer: 0, placardDeduction: 0, pending: 0 };
     stats.trips++;
     stats.settlement += settlement;
     stats.customer += customer;
@@ -2622,39 +2858,55 @@ async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts(
   }
 
   const dates = [...daily.keys()].sort((a, b) => compareServiceDate({ date: a }, { date: b }));
-  const performanceTotal = settlementTotal + customerTotal - placardDeductionTotal;
+  const airportPerformanceTotal = settlementTotal + customerTotal - placardDeductionTotal;
+  const performanceTotal = airportPerformanceTotal + minibusPerformanceTotal;
   const summaryRows = [
     styledRow([`${year}年${month}月結算報表`, ''], 2),
     ['群組代碼', anonymizeId(groupId)],
     ['資料涵蓋', `${dates[0]}${dates.length > 1 ? `～${dates.at(-1)}` : ''}`],
-    ['總趟數', orders.length],
+    ['機場接送總趟數', airportOrders.length],
     ['結算價總額', settlementTotal],
     ['客收總額', customerTotal],
     ['舉牌服務扣款', placardDeductionTotal],
+    ['機場接送業績', airportPerformanceTotal],
+    ...(minibusOrders.length ? [
+      ['桃小巴班次', minibusOrders.length],
+      ['桃小巴時數', minibusMinutesTotal / 60],
+      ['桃小巴業績', minibusPerformanceTotal],
+    ] : []),
     ['業績總額', performanceTotal],
-    ['平均每趟業績', Math.round((performanceTotal / orders.length) * 10) / 10],
+    ['平均每趟機場接送業績', airportOrders.length ? Math.round((airportPerformanceTotal / airportOrders.length) * 10) / 10 : 0],
     ['待確認金額筆數', pendingCount],
     [],
-    styledRow(['日期', '趟數', '結算價', '客收', '舉牌扣款', '業績', '待確認筆數'], 1),
+    styledRow(['日期', '機場趟數', '結算價', '客收', '舉牌扣款', '桃小巴時數', '桃小巴業績', '業績', '待確認筆數'], 1),
     ...dates.map(date => {
       const stats = daily.get(date);
       return [date, stats.trips, stats.settlement, stats.customer, stats.placardDeduction,
-        stats.settlement + stats.customer - stats.placardDeduction, stats.pending];
+        stats.minibusMinutes / 60, stats.minibusPerformance,
+        stats.settlement + stats.customer - stats.placardDeduction + stats.minibusPerformance, stats.pending];
     }),
   ];
   const detailRows = [
-    styledRow(['日期', '時間', '接送', '縣市區域', '人數', '訂單編號', '結算價', '客收', '舉牌扣款', '業績', '必要備註'], 1),
+    styledRow(['日期', '開始時間', '結束時間', '業務類型', '接送', '縣市區域／班次', '人數', '訂單編號', '結算價', '客收', '舉牌扣款', '桃小巴時數', '業績', '必要備註'], 1),
     ...orders.map(order => {
+      if (order.isMinibus) {
+        return [
+          order.date || '', order.time || '', order.endTime || '', '桃小巴', '', order.minibusLabel || '桃小巴', '', '', '', '', '',
+          (Number(order.durationMinutes) || 0) / 60, getMinibusPerformance(order), '',
+        ];
+      }
       const settlement = typeof order.price === 'number' ? order.price : 0;
       const customer = getCustomerCollectionTotal(order);
       const placardDeduction = getPlacardDeduction(order);
       return [
-        order.date || '', order.time || '', order.type || '', order.loc || '', order.pax ?? '',
+        order.date || '', order.time || '', '', '機場接送', order.type || '', order.loc || '', order.pax ?? '',
         order.orderId || '', typeof order.price === 'number' ? order.price : '', customer,
-        placardDeduction, settlement + customer - placardDeduction, getSummaryLineRemarks(order).join('、'),
+        placardDeduction, '', settlement + customer - placardDeduction, getSummaryLineRemarks(order).join('、'),
       ];
     }),
   ];
+
+  const summaryHeaderRow = summaryRows.findIndex(row => row?.[0]?.value === '日期') + 1;
 
   const created = new Date().toISOString();
   const files = {
@@ -2663,8 +2915,8 @@ async function buildMonthlyWorkbook(groupId, month, year = getBusinessDateParts(
     'xl/workbook.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="月結總表" sheetId="1" r:id="rId1"/><sheet name="訂單明細" sheetId="2" r:id="rId2"/></sheets></workbook>'),
     'xl/_rels/workbook.xml.rels': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>'),
     'xl/styles.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="3"><font><sz val="11"/><name val="Arial"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Arial"/></font><font><b/><sz val="14"/><name val="Arial"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF1F4E78"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="2"><border/><border><left style="thin"/><right style="thin"/><top style="thin"/><bottom style="thin"/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>'),
-    'xl/worksheets/sheet1.xml': strToU8(worksheetXml(summaryRows, [22, 22, 16, 16, 16, 16, 16], `A12:G${summaryRows.length}`)),
-    'xl/worksheets/sheet2.xml': strToU8(worksheetXml(detailRows, [12, 10, 10, 24, 10, 18, 14, 14, 14, 14, 18], `A1:K${detailRows.length}`)),
+    'xl/worksheets/sheet1.xml': strToU8(worksheetXml(summaryRows, [22, 18, 16, 16, 16, 16, 16, 16, 16], `A${summaryHeaderRow}:I${summaryRows.length}`)),
+    'xl/worksheets/sheet2.xml': strToU8(worksheetXml(detailRows, [12, 12, 12, 14, 10, 24, 10, 18, 14, 14, 14, 14, 14, 18], `A1:N${detailRows.length}`)),
     'docProps/core.xml': strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>${year}年${month}月機場接送月結</dc:title><dc:creator>Airport Transfer Bot</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">${created}</dcterms:created></cp:coreProperties>`),
     'docProps/app.xml': strToU8('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Airport Transfer Bot</Application></Properties>'),
   };
@@ -2783,6 +3035,7 @@ module.exports = {
   parseAddrNoDefault,
   parseOrders,
   parsePlaceholder,
+  parseMinibusShift,
   parseTransferOrder,
   parseDriverReportOrder,
   parseTableOrder,
@@ -2795,6 +3048,10 @@ module.exports = {
   hasPlacardService,
   isPlacardSelfPickup,
   getPlacardDeduction,
+  getMinibusPerformance,
+  formatHoursFromMinutes,
+  clearMatchingPlaceholder,
+  placeholderMatchesOrder,
   normalizeDate,
   extractServiceYear,
   getBusinessDateParts,
